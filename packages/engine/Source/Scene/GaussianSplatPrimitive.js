@@ -27,6 +27,7 @@ import VertexAttributeSemantic from "./VertexAttributeSemantic.js";
 import AttributeType from "./AttributeType.js";
 import ModelComponents from "./ModelComponents.js";
 import Axis from "./Axis.js";
+import Cartesian2 from "../Core/Cartesian2.js";
 import Cartesian3 from "../Core/Cartesian3.js";
 import Quaternion from "../Core/Quaternion.js";
 import SplitDirection from "./SplitDirection.js";
@@ -144,6 +145,31 @@ function GaussianSplatPrimitive(options) {
    * @private
    */
   this._needsGaussianSplatTexture = true;
+
+  /**
+   * OUTLINE_PASS support - added for screen-space outline rendering
+   * Indicates whether the primitive is in outline rendering mode.
+   * Reference: PlayCanvas/supersplat outline implementation
+   * @type {boolean}
+   * @private
+   */
+  this._outlineMode = false;
+
+  /**
+   * State texture for managing splat selection/visibility states.
+   * Format: R8, where each byte represents splat state (bit 0=selected, bit 1=locked, bit 2=deleted)
+   * @type {undefined|Texture}
+   * @private
+   */
+  this._stateTexture = undefined;
+
+  /**
+   * State texture dimensions
+   * @type {number}
+   * @private
+   */
+  this._stateTextureWidth = 0;
+  this._stateTextureHeight = 0;
 
   /**
    * The previous view matrix used to determine if the primitive needs to be updated.
@@ -684,6 +710,81 @@ GaussianSplatPrimitive.buildGSplatDrawCommand = function (
     return primitive._sphericalHarmonicsDegree;
   };
 
+  // OUTLINE_PASS support - add state texture uniforms when in outline mode
+  // Reference: PlayCanvas/supersplat outline implementation
+  console.log("[buildGSplatDrawCommand] 检查 OUTLINE_PASS 条件:");
+  console.log("- primitive._outlineMode:", primitive._outlineMode);
+  console.log("- primitive._stateTexture:", primitive._stateTexture);
+  console.log(
+    "- defined(primitive._stateTexture):",
+    defined(primitive._stateTexture),
+  );
+  console.log(
+    "- 条件结果:",
+    primitive._outlineMode && defined(primitive._stateTexture),
+  );
+
+  if (primitive._outlineMode && defined(primitive._stateTexture)) {
+    console.log("✅ 添加 OUTLINE_PASS define 和 uniforms");
+
+    // 调试：检查 addDefine 之前的状态
+    console.log(
+      "[addDefine 之前] VS defineLines:",
+      shaderBuilder._vertexShaderParts.defineLines,
+    );
+    console.log(
+      "[addDefine 之前] FS defineLines:",
+      shaderBuilder._fragmentShaderParts.defineLines,
+    );
+
+    shaderBuilder.addDefine("OUTLINE_PASS");
+
+    // 调试：检查 addDefine 之后的状态
+    console.log(
+      "[addDefine 之后] VS defineLines:",
+      shaderBuilder._vertexShaderParts.defineLines,
+    );
+    console.log(
+      "[addDefine 之后] FS defineLines:",
+      shaderBuilder._fragmentShaderParts.defineLines,
+    );
+    console.log(
+      "[addDefine 之后] VS 包含 OUTLINE_PASS:",
+      shaderBuilder._vertexShaderParts.defineLines.includes("OUTLINE_PASS"),
+    );
+    console.log(
+      "[addDefine 之后] FS 包含 OUTLINE_PASS:",
+      shaderBuilder._fragmentShaderParts.defineLines.includes("OUTLINE_PASS"),
+    );
+
+    shaderBuilder.addUniform(
+      "highp sampler2D",
+      "u_splatStateTexture",
+      ShaderDestination.VERTEX,
+    );
+
+    shaderBuilder.addUniform(
+      "vec2",
+      "u_stateTextureSize",
+      ShaderDestination.VERTEX,
+    );
+
+    uniformMap.u_splatStateTexture = function () {
+      return primitive._stateTexture;
+    };
+
+    uniformMap.u_stateTextureSize = function () {
+      return new Cartesian2(
+        primitive._stateTextureWidth,
+        primitive._stateTextureHeight,
+      );
+    };
+
+    console.log("✅ OUTLINE_PASS 支持已添加");
+  } else {
+    console.log("❌ OUTLINE_PASS 条件检查失败，未添加");
+  }
+
   uniformMap.u_cameraPositionWC = function () {
     return Cartesian3.clone(frameState.camera.positionWC);
   };
@@ -711,11 +812,56 @@ GaussianSplatPrimitive.buildGSplatDrawCommand = function (
   renderResources.primitiveType = PrimitiveType.TRIANGLE_STRIP;
   shaderBuilder.addVertexLines(GaussianSplatVS);
   shaderBuilder.addFragmentLines(GaussianSplatFS);
+
+  // 调试：检查 shaderBuilder 的 define 列表
+  if (primitive._outlineMode) {
+    console.log(
+      "[buildGSplatDrawCommand] 在 buildShaderProgram 之前检查 shaderBuilder:",
+    );
+    console.log(
+      "- VS defineLines:",
+      shaderBuilder._vertexShaderParts.defineLines,
+    );
+    console.log(
+      "- FS defineLines:",
+      shaderBuilder._fragmentShaderParts.defineLines,
+    );
+    console.log(
+      "- VS 包含 OUTLINE_PASS:",
+      shaderBuilder._vertexShaderParts.defineLines.includes("OUTLINE_PASS"),
+    );
+    console.log(
+      "- FS 包含 OUTLINE_PASS:",
+      shaderBuilder._fragmentShaderParts.defineLines.includes("OUTLINE_PASS"),
+    );
+  }
+
   const shaderProgram = shaderBuilder.buildShaderProgram(frameState.context);
+
+  // 调试：检查编译后的 shader program
+  if (primitive._outlineMode) {
+    console.log("[buildGSplatDrawCommand] 编译后的 shader program:");
+    console.log("- VS defines:", shaderProgram._vertexShaderSource.defines);
+    console.log("- FS defines:", shaderProgram._fragmentShaderSource.defines);
+    console.log(
+      "- VS 包含 OUTLINE_PASS:",
+      shaderProgram._vertexShaderSource.defines.includes("OUTLINE_PASS"),
+    );
+    console.log(
+      "- FS 包含 OUTLINE_PASS:",
+      shaderProgram._fragmentShaderSource.defines.includes("OUTLINE_PASS"),
+    );
+  }
   let renderState = clone(
     RenderState.fromCache(renderResources.renderStateOptions),
     true,
   );
+
+  // OUTLINE_PASS: 禁用深度测试，确保所有 splat 都能渲染
+  if (primitive._outlineMode) {
+    renderState.depthTest.enabled = false;
+    renderState.depthMask = false;
+  }
 
   renderState.cull.face = ModelUtility.getCullFace(
     tileset.modelMatrix,

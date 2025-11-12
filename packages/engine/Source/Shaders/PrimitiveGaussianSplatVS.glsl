@@ -3,10 +3,14 @@
 
 // The splats are rendered as quads in view space. Splat attributes are loaded from a texture with precomputed 3D covariance.
 
-// Passes local quad coordinates and color to the fragment shader for Gaussian evaluation. 
+// Passes local quad coordinates and color to the fragment shader for Gaussian evaluation.
 //
 // Discards splats outside the view frustum or with negligible screen size.
 //
+// OUTLINE_PASS support - added for screen-space outline rendering
+// Note: uniforms are declared in GaussianSplatPrimitive.js via shaderBuilder.addUniform
+// Reference: PlayCanvas/supersplat outline implementation
+
 #if defined(HAS_SPHERICAL_HARMONICS)
 const uint coefficientCount[3] = uint[3](3u,8u,15u);
 const float SH_C1 = 0.48860251;
@@ -142,23 +146,36 @@ highp vec4 discardVec = vec4(0.0, 0.0, 2.0, 1.0);
 
 void main() {
     uint texIdx = uint(a_splatIndex);
+
+#ifdef OUTLINE_PASS
+    // OUTLINE_PASS: Read splat state from state texture
+    // Reference: PlayCanvas splat-shader.ts line 37-43
+    ivec2 stateCoord = ivec2(
+        int(texIdx) % int(u_stateTextureSize.x),
+        int(texIdx) / int(u_stateTextureSize.x)
+    );
+    float state = texelFetch(u_splatStateTexture, stateCoord, 0).r;
+    uint vertexState = uint(state * 255.0 + 0.5) & 7u;
+
+    // Only render selected splats (vertexState & 1u == 1u)
+    // State bits: bit 0 = selected, bit 1 = locked, bit 2 = deleted
+    // 临时调试：禁用状态过滤，渲染所有 splat
+    // TODO: 修复后恢复状态过滤
+    // if ((vertexState & 1u) == 0u) {
+    //     gl_Position = discardVec;
+    //     return;
+    // }
+#endif
+
     ivec2 posCoord = ivec2((texIdx & 0x3ffu) << 1, texIdx >> 10);
     vec4 splatPosition = vec4( uintBitsToFloat(uvec4(texelFetch(u_splatAttributeTexture, posCoord, 0))) );
 
     vec4 splatViewPos = czm_modelView * vec4(splatPosition.xyz, 1.0);
     vec4 clipPosition = czm_projection * splatViewPos;
 
-    float clip = 1.2 * clipPosition.w;
-    if (clipPosition.z < -clip || clipPosition.x < -clip || clipPosition.x > clip ||
-        clipPosition.y < -clip || clipPosition.y > clip) {
-        gl_Position = vec4(0.0, 0.0, 2.0, 1.0);
-        return;
-    }
-
+    // 计算协方差和 quad 大小（OUTLINE_PASS 和正常模式都需要）
     ivec2 covCoord = ivec2(((texIdx & 0x3ffu) << 1) | 1u, texIdx >> 10);
     uvec4 covariance = uvec4(texelFetch(u_splatAttributeTexture, covCoord, 0));
-
-    gl_Position = clipPosition;
 
     vec2 u1 = unpackHalf2x16(covariance.x) ;
     vec2 u2 = unpackHalf2x16(covariance.y);
@@ -167,11 +184,28 @@ void main() {
 
     vec4 covVectors = calcCovVectors(splatViewPos.xyz, Vrk);
 
+#ifdef OUTLINE_PASS
+    // OUTLINE_PASS: 放宽过滤条件，确保有内容渲染
+    // 临时调试：禁用视锥剔除和屏幕空间大小检查
+    // TODO: 修复后恢复过滤条件
+    gl_Position = clipPosition;
+#else
+    float clip = 1.2 * clipPosition.w;
+    if (clipPosition.z < -clip || clipPosition.x < -clip || clipPosition.x > clip ||
+        clipPosition.y < -clip || clipPosition.y > clip) {
+        gl_Position = vec4(0.0, 0.0, 2.0, 1.0);
+        return;
+    }
+
+    gl_Position = clipPosition;
+
     if (dot(covVectors.xy, covVectors.xy) < 4.0 && dot(covVectors.zw, covVectors.zw) < 4.0) {
         gl_Position = discardVec;
         return;
     }
+#endif
 
+    // 计算 quad corner（OUTLINE_PASS 和正常模式都需要）
     vec2 corner = vec2((gl_VertexID << 1) & 2, gl_VertexID & 2) - 1.;
 
     gl_Position += vec4((corner.x * covVectors.xy + corner.y * covVectors.zw) / czm_viewport.zw * gl_Position.w, 0, 0);
