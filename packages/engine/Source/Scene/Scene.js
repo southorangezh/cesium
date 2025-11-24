@@ -81,7 +81,6 @@ import VoxelPrimitive from "./VoxelPrimitive.js";
 import getMetadataClassProperty from "./getMetadataClassProperty.js";
 import PickedMetadataInfo from "./PickedMetadataInfo.js";
 import getMetadataProperty from "./getMetadataProperty.js";
-import GaussianSplatOutline from "./GaussianSplatOutline.js";
 
 const requestRenderAfterFrame = function (scene) {
   return function () {
@@ -620,15 +619,6 @@ function Scene(options) {
    */
   this.postProcessStages = new PostProcessStageCollection();
 
-  /**
-   * Gaussian Splat outline system for rendering screen-space outlines
-   * Must be initialized AFTER postProcessStages
-   * Reference: PlayCanvas/supersplat outline implementation
-   * @type {GaussianSplatOutline}
-   * @private
-   */
-  this._gaussianSplatOutline = new GaussianSplatOutline(this);
-
   this._brdfLutGenerator = new BrdfLutGenerator();
 
   this._performanceDisplay = undefined;
@@ -825,20 +815,6 @@ Object.defineProperties(Scene.prototype, {
   canvas: {
     get: function () {
       return this._canvas;
-    },
-  },
-
-  /**
-   * Gets the Gaussian Splat outline system for rendering screen-space outlines.
-   * Reference: PlayCanvas/supersplat outline implementation
-   * @memberof Scene.prototype
-   *
-   * @type {GaussianSplatOutline}
-   * @readonly
-   */
-  gaussianSplatOutline: {
-    get: function () {
-      return this._gaussianSplatOutline;
     },
   },
 
@@ -2934,12 +2910,6 @@ function executeCommands(scene, passState) {
     performVoxelsPass(scene, passState, frustumCommands);
 
     performPass(frustumCommands, Pass.OPAQUE);
-
-    // Render Gaussian Splat outline pass before main Gaussian Splat rendering
-    // Reference: PlayCanvas outline.ts line 135-160
-    if (scene._gaussianSplatOutline.enabled) {
-      scene._gaussianSplatOutline.renderOutlinePass(frameState);
-    }
 
     performGaussianSplatPass(scene, passState, frustumCommands);
 

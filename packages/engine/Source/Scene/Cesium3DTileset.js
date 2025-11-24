@@ -63,6 +63,7 @@ import Cesium3DTilesetSkipTraversal from "./Cesium3DTilesetSkipTraversal.js";
 import Ray from "../Core/Ray.js";
 import DynamicEnvironmentMapManager from "./DynamicEnvironmentMapManager.js";
 import ImageryLayerCollection from "./ImageryLayerCollection.js";
+import createGuid from "../Core/createGuid.js";
 
 /**
  * @typedef {object} Cesium3DTileset.ConstructorOptions
@@ -135,6 +136,63 @@ import ImageryLayerCollection from "./ImageryLayerCollection.js";
  * @property {boolean} [debugShowRenderingStatistics=false] For debugging only. When true, draws labels to indicate the number of commands, points, triangles and features for each tile.
  * @property {boolean} [debugShowMemoryUsage=false] For debugging only. When true, draws labels to indicate the texture and geometry memory in megabytes used by each tile.
  * @property {boolean} [debugShowUrl=false] For debugging only. When true, draws labels to indicate the url of each tile.
+ */
+
+/**
+ * @typedef {Object} Cesium3DTileset~SplatColorFilterOptions
+ *
+ * Options passed to {@link Cesium3DTileset#addSplatColorFilter}.
+ *
+ * @property {Function} callback Callback invoked for each splat. It receives <code>(context, userOptions)</code> and can return
+ * an object describing color changes. Returning <code>undefined</code> or <code>false</code> leaves the splat untouched.
+ * @property {string} [id] Custom identifier for the filter. If omitted, a GUID will be generated.
+ * @property {string} [name] Friendly name used for debugging or logging.
+ * @property {number} [priority=0] Filters run in ascending priority order.
+ * @property {boolean} [enabled=true] Whether the filter is active.
+ * @property {boolean} [once=false] If <code>true</code>, the filter automatically disables itself after the next texture regeneration.
+ * @property {*} [options] Arbitrary user data forwarded to the callback as the second argument.
+ * @property {*} [userData] Additional user data accessible via <code>context.userData</code>.
+ * @property {*} [thisArg] Optional <code>this</code> context for the callback.
+ *
+ * @example
+ * tileset.addSplatColorFilter({
+ *   name: "FadeOutsideRange",
+ *   options: { minHeight: 0.0, maxHeight: 20.0 },
+ *   callback: function (context, opts) {
+ *     if (!context.position) {
+ *       return;
+ *     }
+ *     const z = context.position.z;
+ *     if (z < opts.minHeight || z > opts.maxHeight) {
+ *       return { alpha: 0.15 };
+ *     }
+ *   },
+ * });
+ *
+ * @example
+ * // Context object available inside the callback
+ * {
+ *   tileset,        // Cesium3DTileset
+ *   primitive,      // GaussianSplatPrimitive
+ *   aggregateIndex, // Index within the aggregated buffers
+ *   plyIndex,       // Original PLY index (if available)
+ *   rgba,           // Uint8Array(4) referencing the current color bytes
+ *   color,          // Cesium.Color instance representing the current color
+ *   position,       // Cartesian3 (if positions are available)
+ *   userData        // Custom user data
+ * }
+ *
+ * @example
+ * // Values that can be returned by the callback
+ * {
+ *   color,     // Cesium.Color or [r,g,b,(a)]
+ *   rgba,      // Array of byte or normalized color components
+ *   alpha,     // Alpha channel (0-1 or 0-255)
+ *   multiply,  // Multiply RGB components by this factor
+ *   tint,      // Blend towards white by the given factor [0,1]
+ *   discard,   // If true, alpha is set to zero
+ *   stop       // If true, stops evaluating remaining filters for this splat
+ * }
  */
 
 /**
@@ -3915,6 +3973,296 @@ Cesium3DTileset.prototype.isGltfExtensionRequired = function (
   }
 
   return false;
+};
+
+/**
+ * Updates the color of Gaussian splats by their original PLY file indices.
+ * <p>
+ * This method allows you to modify the color of specific points in the Gaussian splatting model
+ * by referencing their original indices in the PLY file. The color changes will be applied
+ * when the splat texture is regenerated.
+ * </p>
+ *
+ * @param {number|Array<number>} plyIndices The PLY point index or array of indices to modify.
+ * @param {Color|Array<Color>} colors The color or array of colors to apply.
+ *   If a single color is provided with multiple indices, the same color will be applied to all indices.
+ *   If an array of colors is provided, it must have the same length as the indices array.
+ *
+ * @exception {RuntimeError} If the Gaussian splat primitive is not initialized.
+ * @exception {RuntimeError} If colors is an array and has a different length than indices.
+ *
+ * @example
+ * // Modify a single point
+ * tileset.updateSplatColorByPlyIndex(12345, Cesium.Color.RED);
+ *
+ * // Modify multiple points with the same color
+ * tileset.updateSplatColorByPlyIndex([100, 200, 300], Cesium.Color.RED);
+ *
+ * // Modify multiple points with different colors
+ * tileset.updateSplatColorByPlyIndex(
+ *   [100, 200, 300],
+ *   [Cesium.Color.RED, Cesium.Color.GREEN, Cesium.Color.BLUE]
+ * );
+ */
+Cesium3DTileset.prototype.updateSplatColorByPlyIndex = function (
+  plyIndices,
+  colors,
+) {
+  const primitive = this.gaussianSplatPrimitive;
+  if (!defined(primitive)) {
+    throw new RuntimeError(
+      "Gaussian splat primitive not initialized. The tileset may not contain Gaussian splatting content.",
+    );
+  }
+
+  // 确保索引是数组
+  const indicesArray = Array.isArray(plyIndices) ? plyIndices : [plyIndices];
+
+  // 处理颜色：可以是单个颜色或颜色数组
+  let colorsArray;
+  if (Array.isArray(colors)) {
+    // 如果颜色是数组，长度必须与索引数组相同
+    if (colors.length !== indicesArray.length) {
+      throw new RuntimeError(
+        `Colors array length (${colors.length}) must match indices array length (${indicesArray.length}).`,
+      );
+    }
+    colorsArray = colors;
+  } else {
+    // 如果是单个颜色，应用到所有索引
+    colorsArray = new Array(indicesArray.length).fill(colors);
+  }
+
+  // 存储颜色修改
+  for (let i = 0; i < indicesArray.length; i++) {
+    const plyIndex = indicesArray[i];
+    const color = colorsArray[i];
+
+    if (typeof plyIndex !== "number" || plyIndex < 0) {
+      console.warn(
+        `Invalid PLY index: ${plyIndex}. Skipping color modification.`,
+      );
+      continue;
+    }
+
+    if (!defined(color) || !(color instanceof Color)) {
+      console.warn(
+        `Invalid color for PLY index ${plyIndex}. Skipping color modification.`,
+      );
+      continue;
+    }
+
+    // 转换为RGBA字节数组
+    const rgba = [
+      Math.floor(CesiumMath.clamp(color.red, 0.0, 1.0) * 255),
+      Math.floor(CesiumMath.clamp(color.green, 0.0, 1.0) * 255),
+      Math.floor(CesiumMath.clamp(color.blue, 0.0, 1.0) * 255),
+      Math.floor(CesiumMath.clamp(color.alpha, 0.0, 1.0) * 255),
+    ];
+
+    primitive._colorModifications.set(plyIndex, rgba);
+  }
+
+  // 标记需要更新纹理
+  primitive._needsGaussianSplatTexture = true;
+  primitive._dirty = true;
+};
+
+/**
+ * Clears all color modifications applied to Gaussian splats.
+ * <p>
+ * This method removes all color modifications that were applied using
+ * {@link Cesium3DTileset#updateSplatColorByPlyIndex}. The original colors will be restored
+ * when the splat texture is regenerated.
+ * </p>
+ */
+Cesium3DTileset.prototype.clearSplatColorModifications = function () {
+  const primitive = this.gaussianSplatPrimitive;
+  if (!defined(primitive)) {
+    return;
+  }
+
+  primitive._colorModifications.clear();
+  primitive._needsGaussianSplatTexture = true;
+  primitive._dirty = true;
+};
+
+/**
+ * Adds a custom filter that can modify Gaussian splat colors during texture generation.
+ * <p>
+ * Filters run on the CPU before the splat texture is generated, allowing advanced effects such as
+ * height-based highlighting, grayscale conversion, or opacity adjustments. Filters are executed in the
+ * order of their {@link Cesium3DTileset~SplatColorFilterOptions.priority}.
+ * </p>
+ *
+ * @param {Cesium3DTileset~SplatColorFilterOptions} filterOptions Options describing the custom filter.
+ * @returns {string} The identifier assigned to the filter. This can be used with {@link Cesium3DTileset#removeSplatColorFilter}.
+ *
+ * @throws {RuntimeError} If the Gaussian splat primitive is not initialized.
+ * @throws {RuntimeError} If {@link Cesium3DTileset~SplatColorFilterOptions.callback} is not provided.
+ *
+ * @example
+ * // Basic filter example
+ * const filterId = tileset.addSplatColorFilter({
+ *   name: "HighlightLowPoints",
+ *   priority: 0,
+ *   options: {
+ *     minHeight: -10.0,
+ *     maxHeight: 10.0,
+ *     highlightColor: Cesium.Color.CYAN,
+ *   },
+ *   callback: function(context, options) {
+ *     if (!context.position) {
+ *       return;
+ *     }
+ *     const height = context.position.z;
+ *     if (height >= options.minHeight && height <= options.maxHeight) {
+ *       return {
+ *         color: options.highlightColor,
+ *         alpha: 1.0,
+ *       };
+ *     }
+ *   },
+ * });
+ *
+ * @example
+ * // Gradient filter with filterStrength (参考着色器渐变逻辑)
+ * const gradientFilterId = tileset.addSplatColorFilter({
+ *   name: "GradientFilter",
+ *   priority: 0,
+ *   options: {
+ *     rangeStart: 100,
+ *     rangeEnd: 200,
+ *     filterColor: Cesium.Color.RED,
+ *   },
+ *   callback: function(context, options) {
+ *     const plyIndex = context.plyIndex;
+ *     if (plyIndex >= options.rangeStart && plyIndex <= options.rangeEnd) {
+ *       // 计算范围大小和进度
+ *       const rangeSize = Math.max(options.rangeEnd - options.rangeStart, 1.0);
+ *       const progress = (plyIndex - options.rangeStart) / rangeSize;
+ *
+ *       // 计算滤镜强度（在范围内渐变：1.0 在开始，0.7 在结束）
+ *       let filterStrength = 1.0 - progress * 0.3;
+ *       filterStrength = Cesium.Math.clamp(filterStrength, 0.6, 1.0);
+ *
+ *       return {
+ *         color: options.filterColor,
+ *         filterStrength: filterStrength, // 渐变强度
+ *       };
+ *     }
+ *   },
+ * });
+ */
+Cesium3DTileset.prototype.addSplatColorFilter = function (filterOptions) {
+  const primitive = this.gaussianSplatPrimitive;
+  if (!defined(primitive)) {
+    throw new RuntimeError(
+      "Gaussian splat primitive not initialized. The tileset may not contain Gaussian splatting content.",
+    );
+  }
+
+  const options = defined(filterOptions) ? filterOptions : {};
+  if (typeof options.callback !== "function") {
+    throw new RuntimeError(
+      "filterOptions.callback is required and must be a function.",
+    );
+  }
+
+  const descriptor = {
+    id: defined(options.id) ? options.id : createGuid(),
+    name: options.name,
+    callback: options.callback,
+    options: options.options,
+    userData: options.userData,
+    enabled: options.enabled !== false,
+    priority: defined(options.priority) ? options.priority : 0,
+    thisArg: options.thisArg,
+    once: options.once === true,
+  };
+
+  if (!defined(primitive._customColorFilters)) {
+    primitive._customColorFilters = [];
+  }
+
+  primitive._customColorFilters.push(descriptor);
+  primitive._needsGaussianSplatTexture = true;
+  primitive._dirty = true;
+  return descriptor.id;
+};
+
+/**
+ * Removes a previously registered custom splat color filter.
+ *
+ * @param {string} filterId The identifier returned from {@link Cesium3DTileset#addSplatColorFilter}.
+ * @returns {boolean} <code>true</code> if the filter existed and was removed; otherwise, <code>false</code>.
+ */
+Cesium3DTileset.prototype.removeSplatColorFilter = function (filterId) {
+  const primitive = this.gaussianSplatPrimitive;
+  if (!defined(primitive) || !defined(filterId)) {
+    return false;
+  }
+
+  const filters = primitive._customColorFilters;
+  if (!defined(filters) || filters.length === 0) {
+    return false;
+  }
+
+  const index = filters.findIndex((filter) => filter.id === filterId);
+  if (index === -1) {
+    return false;
+  }
+
+  filters.splice(index, 1);
+  primitive._needsGaussianSplatTexture = true;
+  primitive._dirty = true;
+  return true;
+};
+
+/**
+ * Enables or disables a previously registered splat color filter.
+ *
+ * @param {string} filterId The identifier returned from {@link Cesium3DTileset#addSplatColorFilter}.
+ * @param {boolean} enabled Whether the filter should be enabled.
+ * @returns {boolean} <code>true</code> if the filter exists; otherwise, <code>false</code>.
+ */
+Cesium3DTileset.prototype.setSplatColorFilterEnabled = function (
+  filterId,
+  enabled,
+) {
+  const primitive = this.gaussianSplatPrimitive;
+  if (!defined(primitive) || !defined(filterId)) {
+    return false;
+  }
+
+  const filters = primitive._customColorFilters;
+  if (!defined(filters)) {
+    return false;
+  }
+
+  const descriptor = filters.find((filter) => filter.id === filterId);
+  if (!defined(descriptor)) {
+    return false;
+  }
+
+  descriptor.enabled = enabled;
+  primitive._needsGaussianSplatTexture = true;
+  primitive._dirty = true;
+  return true;
+};
+
+/**
+ * Removes all registered custom splat color filters.
+ */
+Cesium3DTileset.prototype.clearSplatColorFilters = function () {
+  const primitive = this.gaussianSplatPrimitive;
+  if (!defined(primitive) || !defined(primitive._customColorFilters)) {
+    return;
+  }
+
+  primitive._customColorFilters.length = 0;
+  primitive._needsGaussianSplatTexture = true;
+  primitive._dirty = true;
 };
 
 /**

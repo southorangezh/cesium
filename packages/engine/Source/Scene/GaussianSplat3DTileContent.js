@@ -55,6 +55,13 @@ function GaussianSplat3DTileContent(loader, tileset, tile, resource) {
   this._scales = undefined;
 
   /**
+   * Array mapping each splat in this tile to its original PLY index.
+   * @type {undefined|Uint32Array}
+   * @private
+   */
+  this._plyIndices = undefined;
+
+  /**
    * glTF primitive data that contains the Gaussian splat data needed for rendering.
    * @type {undefined|Primitive}
    * @private
@@ -174,7 +181,36 @@ Object.defineProperties(GaussianSplat3DTileContent.prototype, {
    */
   pointsLength: {
     get: function () {
-      return this.gltfPrimitive.attributes[0].count;
+      if (!defined(this.gltfPrimitive)) {
+        return 0;
+      }
+
+      // 使用 semantic 查找 POSITION attribute，不依赖数组顺序
+      const positionAttr = ModelUtility.getAttributeBySemantic(
+        this.gltfPrimitive,
+        VertexAttributeSemantic.POSITION,
+      );
+
+      if (!defined(positionAttr)) {
+        console.warn(
+          "GaussianSplat3DTileContent.pointsLength: 未找到 POSITION attribute",
+        );
+        return 0;
+      }
+
+      return positionAttr.count;
+    },
+  },
+
+  /**
+   * Gets the PLY indices for this tile's Gaussian splats.
+   * @memberof GaussianSplat3DTileContent.prototype
+   * @type {undefined|Uint32Array}
+   * @readonly
+   */
+  plyIndices: {
+    get: function () {
+      return this._plyIndices;
     },
   },
   /**
@@ -614,6 +650,7 @@ GaussianSplat3DTileContent.fromGltf = async function (
     releaseGltfJson: false,
     upAxis: Axis.Y,
     forwardAxis: Axis.Z,
+    loadAttributesAsTypedArray: true, // 加载属性为 typedArray，包括 _PLY_INDEX
   };
 
   if (defined(gltf.asset)) {
@@ -690,6 +727,98 @@ GaussianSplat3DTileContent.prototype.update = function (primitive, frameState) {
         VertexAttributeSemantic.SCALE,
       ).typedArray,
     );
+
+    // 读取 _PLY_INDEX attribute (自定义属性) - 直接从 gltfPrimitive.attributes 读取
+    console.log("GaussianSplat3DTileContent: 读取 _PLY_INDEX attribute");
+
+    const plyIndexAttribute = this.gltfPrimitive.attributes.find(
+      function (attribute) {
+        return attribute.name === "_PLY_INDEX";
+      },
+    );
+
+    if (defined(plyIndexAttribute)) {
+      console.log("  - _PLY_INDEX attribute 找到");
+      console.log(
+        "  - typedArray 存在:",
+        defined(plyIndexAttribute.typedArray),
+      );
+
+      if (defined(plyIndexAttribute.typedArray)) {
+        console.log(
+          "  - typedArray 类型:",
+          plyIndexAttribute.typedArray.constructor.name,
+        );
+        console.log(
+          "  - typedArray 长度:",
+          plyIndexAttribute.typedArray.length,
+        );
+        console.log("  - count:", plyIndexAttribute.count);
+        console.log(
+          "  - componentDatatype:",
+          plyIndexAttribute.componentDatatype,
+        );
+
+        // 如果 typedArray 已经是 Uint32Array,直接使用
+        // 否则需要从 buffer 创建
+        if (plyIndexAttribute.typedArray instanceof Uint32Array) {
+          console.log("  → typedArray 已经是 Uint32Array,直接使用");
+          this._plyIndices = plyIndexAttribute.typedArray;
+        } else {
+          console.log("  → typedArray 不是 Uint32Array,从 buffer 创建");
+          console.log(
+            "    - buffer.byteLength:",
+            plyIndexAttribute.typedArray.buffer.byteLength,
+          );
+          console.log(
+            "    - byteOffset:",
+            plyIndexAttribute.typedArray.byteOffset,
+          );
+          console.log(
+            "    - byteLength:",
+            plyIndexAttribute.typedArray.byteLength,
+          );
+
+          // 从 typedArray 的 buffer 创建 Uint32Array
+          this._plyIndices = new Uint32Array(
+            plyIndexAttribute.typedArray.buffer,
+            plyIndexAttribute.typedArray.byteOffset,
+            plyIndexAttribute.count, // 使用 count,不是 byteLength/4
+          );
+        }
+
+        console.log("  - _plyIndices 长度:", this._plyIndices.length);
+        console.log(
+          "  - _plyIndices 前10个值:",
+          Array.from(
+            this._plyIndices.slice(0, Math.min(10, this._plyIndices.length)),
+          ),
+        );
+        console.log(
+          "  ✓ _PLY_INDEX 成功读取:",
+          this._plyIndices.length,
+          "个索引",
+        );
+      } else {
+        // typedArray 不存在，使用连续索引 fallback
+        console.warn("  ⚠️ _PLY_INDEX typedArray 不存在，使用 fallback");
+        const count = plyIndexAttribute.count;
+        this._plyIndices = new Uint32Array(count);
+        for (let i = 0; i < count; i++) {
+          this._plyIndices[i] = i;
+        }
+        console.log("  → 使用连续索引 fallback:", count, "个");
+      }
+    } else {
+      // _PLY_INDEX 不存在，使用连续索引 fallback
+      console.warn("  ⚠️ 未找到 _PLY_INDEX attribute，使用 fallback");
+      const count = this.pointsLength;
+      this._plyIndices = new Uint32Array(count);
+      for (let i = 0; i < count; i++) {
+        this._plyIndices[i] = i;
+      }
+      console.log("  → 使用连续索引 fallback:", count, "个");
+    }
 
     const { l, n } = degreeAndCoefFromAttributes(this.gltfPrimitive.attributes);
     this._sphericalHarmonicsDegree = l;

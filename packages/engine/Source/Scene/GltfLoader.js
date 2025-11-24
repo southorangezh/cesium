@@ -697,6 +697,22 @@ function getVertexBufferLoader(
   const accessor = gltf.accessors[accessorId];
   const bufferViewId = accessor.bufferView;
 
+  // 如果 accessor 有 bufferView，则不使用 SPZ（SPZ 属性不应该有 bufferView）
+  // 这允许自定义属性（如 PLY_INDEX）使用常规 bufferView，即使 primitive 使用 SPZ 压缩
+  const useSpz = defined(bufferViewId) ? undefined : spzExtension;
+
+  // Debug logging for PLY_INDEX
+  if (
+    semantic === "PLY_INDEX" ||
+    (typeof semantic === "string" && semantic.includes("PLY"))
+  ) {
+    console.log("[GltfLoader] Loading attribute:", semantic);
+    console.log("  - accessorId:", accessorId);
+    console.log("  - bufferViewId:", bufferViewId);
+    console.log("  - useSpz:", useSpz);
+    console.log("  - accessor:", accessor);
+  }
+
   const vertexBufferLoader = ResourceCache.getVertexBufferLoader({
     gltf: gltf,
     gltfResource: loader._gltfResource,
@@ -705,7 +721,7 @@ function getVertexBufferLoader(
     bufferViewId: bufferViewId,
     primitive: primitive,
     draco: draco,
-    spz: spzExtension,
+    spz: useSpz,
     attributeSemantic: semantic,
     accessorId: accessorId,
     asynchronous: loader._asynchronous,
@@ -1196,11 +1212,78 @@ function finalizeAttribute(
 
   if (loadTypedArray) {
     const bufferViewTypedArray = vertexBufferLoader.typedArray;
+
+    // Debug logging for _PLY_INDEX
+    if (attribute.name === "_PLY_INDEX") {
+      console.log("[finalizeAttribute] Processing PLY_INDEX");
+      console.log("  - accessor.count:", accessor.count);
+      console.log("  - accessor.byteOffset:", accessor.byteOffset);
+      console.log("  - accessor.componentType:", accessor.componentType);
+      console.log(
+        "  - bufferViewTypedArray 存在:",
+        defined(bufferViewTypedArray),
+      );
+      if (defined(bufferViewTypedArray)) {
+        console.log(
+          "  - bufferViewTypedArray.length:",
+          bufferViewTypedArray.length,
+        );
+        console.log(
+          "  - bufferViewTypedArray.byteOffset:",
+          bufferViewTypedArray.byteOffset,
+        );
+        console.log(
+          "  - bufferViewTypedArray.byteLength:",
+          bufferViewTypedArray.byteLength,
+        );
+        console.log(
+          "  - bufferViewTypedArray 前几个值:",
+          Array.from(
+            bufferViewTypedArray.slice(
+              0,
+              Math.min(10, bufferViewTypedArray.length),
+            ),
+          ),
+        );
+      }
+    }
+
     attribute.typedArray = getPackedTypedArray(
       gltf,
       accessor,
       bufferViewTypedArray,
     );
+
+    // Debug logging after getPackedTypedArray
+    if (attribute.name === "PLY_INDEX") {
+      console.log("[finalizeAttribute] PLY_INDEX 处理完成");
+      console.log(
+        "  - attribute.typedArray 长度:",
+        attribute.typedArray.length,
+      );
+      console.log(
+        "  - 前几个值:",
+        Array.from(
+          attribute.typedArray.slice(
+            0,
+            Math.min(10, attribute.typedArray.length),
+          ),
+        ),
+      );
+    }
+
+    // Debug logging after getPackedTypedArray
+    if (attribute.name === "PLY_INDEX") {
+      console.log("  - 生成的 typedArray.length:", attribute.typedArray.length);
+      console.log(
+        "  - 生成的 typedArray.byteOffset:",
+        attribute.typedArray.byteOffset,
+      );
+      console.log(
+        "  - 生成的 typedArray 前几个值:",
+        Array.from(attribute.typedArray.slice(0, 10)),
+      );
+    }
 
     if (!loadBuffer) {
       // If the buffer isn't loaded, then the accessor's byteOffset and
@@ -1269,11 +1352,21 @@ function loadAttribute(
   // Save this finish callback by the loader index so it can be called
   // in process().
   loader._geometryCallbacks[index] = () => {
+    // Debug logging for _PLY_INDEX
+    if (gltfSemantic === "_PLY_INDEX") {
+      console.log("[geometryCallback] _PLY_INDEX 回调被调用");
+      console.log("  - defined(draco):", defined(draco));
+      console.log("  - defined(spz):", defined(spz));
+    }
+
     if (
       defined(draco) &&
       defined(draco.attributes) &&
       defined(draco.attributes[gltfSemantic])
     ) {
+      if (gltfSemantic === "PLY_INDEX") {
+        console.log("  → 走 finalizeDracoAttribute 分支");
+      }
       finalizeDracoAttribute(
         attribute,
         vertexBufferLoader,
@@ -1281,6 +1374,9 @@ function loadAttribute(
         loadTypedArray,
       );
     } else if (defined(spz)) {
+      if (gltfSemantic === "PLY_INDEX") {
+        console.log("  → 走 finalizeSpzAttribute 分支");
+      }
       finalizeSpzAttribute(
         attribute,
         vertexBufferLoader,
@@ -1288,6 +1384,9 @@ function loadAttribute(
         loadTypedArray,
       );
     } else {
+      if (gltfSemantic === "PLY_INDEX") {
+        console.log("  → 走 finalizeAttribute 分支");
+      }
       finalizeAttribute(
         gltf,
         accessor,
@@ -2093,19 +2192,48 @@ function loadPrimitive(loader, gltfPrimitive, hasInstances, frameState) {
         continue;
       }
       const accessorId = attributes[semantic];
+
+      // Debug logging for _PLY_INDEX
+      if (semantic === "_PLY_INDEX") {
+        console.log("[loadPrimitive] 发现 _PLY_INDEX attribute");
+        console.log("  - semantic:", semantic);
+        console.log("  - accessorId:", accessorId);
+      }
+
       const semanticInfo = getSemanticInfo(
         loader,
         VertexAttributeSemantic,
         semantic,
       );
 
+      // Debug logging for _PLY_INDEX
+      if (semantic === "_PLY_INDEX") {
+        console.log("  - semanticInfo:", semanticInfo);
+        console.log("  - modelSemantic:", semanticInfo.modelSemantic);
+      }
+
       const modelSemantic = semanticInfo.modelSemantic;
       if (loadForClassification && !isClassificationAttribute(modelSemantic)) {
+        console.log("  [loadPrimitive] 跳过 PLY_INDEX (loadForClassification)");
         continue;
       }
 
       if (modelSemantic === VertexAttributeSemantic.FEATURE_ID) {
         hasFeatureIds = true;
+      }
+
+      // 检查此属性的 accessor 是否有 bufferView
+      // 如果有,说明它不是 SPZ 压缩的,应传 undefined
+      const accessor = loader.gltfJson.accessors[accessorId];
+      const hasBufferView = defined(accessor.bufferView);
+      const useSpzForAttribute = hasBufferView ? undefined : spzExtension;
+
+      // Debug logging for _PLY_INDEX
+      if (semantic === "_PLY_INDEX") {
+        console.log("[loadPrimitive] 确定 _PLY_INDEX 的 spz 参数");
+        console.log("  - hasBufferView:", hasBufferView);
+        console.log("  - spzExtension:", spzExtension);
+        console.log("  - useSpzForAttribute:", useSpzForAttribute);
       }
 
       const attributePlan = loadVertexAttribute(
@@ -2114,7 +2242,7 @@ function loadPrimitive(loader, gltfPrimitive, hasInstances, frameState) {
         semanticInfo,
         gltfPrimitive,
         draco,
-        spzExtension,
+        useSpzForAttribute,
         hasInstances,
         needsPostProcessing,
         frameState,

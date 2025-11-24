@@ -53,12 +53,48 @@ GaussianSplatTextureGenerator.generateFromAttributes = function (parameters) {
   }
 
   const { attributes } = parameters;
-  return textureTaskProcessor.scheduleTask(parameters, [
+
+  // ========================================
+  // [方案1] 添加调试日志
+  // ========================================
+  console.log(`\n[方案1-TextureGen] generateFromAttributes 调用:`);
+  console.log(`[方案1-TextureGen]   - count: ${parameters.count}`);
+  console.log(
+    `[方案1-TextureGen]   - positions: ${attributes.positions.length}`,
+  );
+  console.log(`[方案1-TextureGen]   - scales: ${attributes.scales.length}`);
+  console.log(
+    `[方案1-TextureGen]   - rotations: ${attributes.rotations.length}`,
+  );
+  console.log(`[方案1-TextureGen]   - colors: ${attributes.colors.length}`);
+  console.log(
+    `[方案1-TextureGen]   - plyIndices 存在: ${defined(attributes.plyIndices)}`,
+  );
+  if (defined(attributes.plyIndices)) {
+    console.log(
+      `[方案1-TextureGen]   - plyIndices 长度: ${attributes.plyIndices.length}`,
+    );
+    console.log(
+      `[方案1-TextureGen]   - plyIndices 前5个: [${Array.from(attributes.plyIndices.slice(0, 5)).join(", ")}]`,
+    );
+  }
+
+  // ========================================
+  // [方案1] 传递 PLY 索引缓冲区
+  // ========================================
+  const transferList = [
     attributes.positions.buffer,
     attributes.scales.buffer,
     attributes.rotations.buffer,
     attributes.colors.buffer,
-  ]);
+  ];
+
+  if (defined(attributes.plyIndices)) {
+    transferList.push(attributes.plyIndices.buffer);
+    console.log(`[方案1-TextureGen] ✓ PLY 索引缓冲区已添加到传输列表`);
+  }
+
+  return textureTaskProcessor.scheduleTask(parameters, transferList);
 };
 
 export default GaussianSplatTextureGenerator;

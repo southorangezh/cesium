@@ -27,18 +27,22 @@ import VertexAttributeSemantic from "./VertexAttributeSemantic.js";
 import AttributeType from "./AttributeType.js";
 import ModelComponents from "./ModelComponents.js";
 import Axis from "./Axis.js";
-import Cartesian2 from "../Core/Cartesian2.js";
 import Cartesian3 from "../Core/Cartesian3.js";
 import Quaternion from "../Core/Quaternion.js";
 import SplitDirection from "./SplitDirection.js";
 import destroyObject from "../Core/destroyObject.js";
 import ContextLimits from "../Renderer/ContextLimits.js";
 import Transforms from "../Core/Transforms.js";
+import Color from "../Core/Color.js";
+import CesiumMath from "../Core/Math.js";
 
 const scratchMatrix4A = new Matrix4();
 const scratchMatrix4B = new Matrix4();
 const scratchMatrix4C = new Matrix4();
 const scratchMatrix4D = new Matrix4();
+const scratchFilterPosition = new Cartesian3();
+const scratchFilterRgba = new Uint8Array(4);
+const scratchFilterColor = new Color();
 
 const GaussianSplatSortingState = {
   IDLE: 0,
@@ -82,6 +86,261 @@ function createGaussianSplatTexture(context, splatTextureData) {
     flipY: false,
     sampler: Sampler.NEAREST,
   });
+}
+
+function clampByte(value) {
+  return Math.round(CesiumMath.clamp(value, 0.0, 255.0));
+}
+
+function assignArrayColor(target, source) {
+  const length = Math.min(source.length, 4);
+  for (let i = 0; i < length; i++) {
+    const component = source[i];
+    target[i] =
+      component <= 1.0 && component >= 0.0
+        ? clampByte(component * 255.0)
+        : clampByte(component);
+  }
+}
+
+function applyCustomColorFilters(
+  primitive,
+  colors,
+  componentsPerColor,
+  isRgba,
+) {
+  if (
+    !defined(primitive._customColorFilters) ||
+    primitive._customColorFilters.length === 0
+  ) {
+    return;
+  }
+
+  const activeFilters = primitive._customColorFilters.filter(
+    (filter) =>
+      defined(filter) &&
+      filter.enabled !== false &&
+      typeof filter.callback === "function",
+  );
+
+  if (activeFilters.length === 0) {
+    return;
+  }
+
+  activeFilters.sort((a, b) => (a.priority || 0) - (b.priority || 0));
+
+  const hasPositions = defined(primitive._positions);
+  const positions = primitive._positions;
+  const hasPlyIndices = defined(primitive._plyIndicesAggregate);
+  const contextPosition = hasPositions ? scratchFilterPosition : undefined;
+
+  const filterContext = {
+    tileset: primitive._tileset,
+    primitive: primitive,
+    aggregateIndex: 0,
+    plyIndex: 0,
+    position: contextPosition,
+    rgba: scratchFilterRgba,
+    color: scratchFilterColor,
+    userData: undefined,
+  };
+
+  for (let i = 0; i < primitive._numSplats; i++) {
+    const colorIndex = i * componentsPerColor;
+    scratchFilterRgba[0] = colors[colorIndex];
+    scratchFilterRgba[1] = colors[colorIndex + 1];
+    scratchFilterRgba[2] = colors[colorIndex + 2];
+    scratchFilterRgba[3] = isRgba ? colors[colorIndex + 3] : 255;
+
+    Color.fromBytes(
+      scratchFilterRgba[0],
+      scratchFilterRgba[1],
+      scratchFilterRgba[2],
+      scratchFilterRgba[3],
+      scratchFilterColor,
+    );
+
+    filterContext.aggregateIndex = i;
+    filterContext.plyIndex = hasPlyIndices
+      ? primitive._plyIndicesAggregate[i]
+      : i;
+
+    if (hasPositions && defined(contextPosition)) {
+      const positionIndex = i * 3;
+      contextPosition.x = positions[positionIndex];
+      contextPosition.y = positions[positionIndex + 1];
+      contextPosition.z = positions[positionIndex + 2];
+    }
+
+    let modified = false;
+    let overrideAlphaSet = false;
+    let overrideAlphaValue = 255;
+
+    for (let j = 0; j < activeFilters.length; j++) {
+      const descriptor = activeFilters[j];
+      filterContext.userData = descriptor.userData;
+
+      let result;
+      try {
+        result = descriptor.callback.call(
+          descriptor.thisArg,
+          filterContext,
+          descriptor.options,
+        );
+      } catch (error) {
+        console.error(
+          `Gaussian splat filter "${
+            descriptor.name || descriptor.id || "anonymous"
+          }" failed:`,
+          error,
+        );
+        continue;
+      }
+
+      if (!defined(result) || result === false) {
+        continue;
+      }
+
+      let stopProcessing = false;
+
+      if (result.discard === true) {
+        scratchFilterRgba[3] = 0;
+        modified = true;
+        stopProcessing = true;
+      }
+
+      if (defined(result.alpha)) {
+        const alphaValue =
+          result.alpha > 1.0 ? result.alpha : result.alpha * 255.0;
+        overrideAlphaValue = clampByte(alphaValue);
+        scratchFilterRgba[3] = overrideAlphaValue;
+        overrideAlphaSet = true;
+        modified = true;
+      }
+
+      if (defined(result.multiply)) {
+        const factor = result.multiply;
+        scratchFilterRgba[0] = clampByte(scratchFilterRgba[0] * factor);
+        scratchFilterRgba[1] = clampByte(scratchFilterRgba[1] * factor);
+        scratchFilterRgba[2] = clampByte(scratchFilterRgba[2] * factor);
+        modified = true;
+      }
+
+      if (defined(result.rgba)) {
+        assignArrayColor(scratchFilterRgba, result.rgba);
+        if (overrideAlphaSet) {
+          scratchFilterRgba[3] = overrideAlphaValue;
+        }
+        modified = true;
+      }
+
+      if (defined(result.color)) {
+        // 保存原始颜色用于混合
+        const originalRgba = [
+          scratchFilterRgba[0],
+          scratchFilterRgba[1],
+          scratchFilterRgba[2],
+          scratchFilterRgba[3],
+        ];
+
+        let filterColorRgba;
+        if (result.color instanceof Color) {
+          filterColorRgba = new Uint8Array(4);
+          result.color.toBytes(filterColorRgba);
+        } else if (Array.isArray(result.color)) {
+          filterColorRgba = new Uint8Array(4);
+          assignArrayColor(filterColorRgba, result.color);
+        } else {
+          filterColorRgba = scratchFilterRgba;
+        }
+
+        // 如果指定了 filterStrength，进行颜色混合（参考着色器逻辑）
+        if (defined(result.filterStrength)) {
+          const filterStrength = CesiumMath.clamp(
+            result.filterStrength,
+            0.0,
+            1.0,
+          );
+
+          // 参考着色器逻辑：mix(originalColor, colorFiltered, filterStrength)
+          // 增强匹配滤镜颜色的通道，减少其他通道
+          const colorFiltered = [
+            originalRgba[0] * (0.5 + (filterColorRgba[0] / 255.0) * 0.9),
+            originalRgba[1] * (0.5 + (filterColorRgba[1] / 255.0) * 0.9),
+            originalRgba[2] * (0.5 + (filterColorRgba[2] / 255.0) * 0.9),
+          ];
+
+          // 混合原始颜色和滤镜颜色
+          scratchFilterRgba[0] = clampByte(
+            originalRgba[0] * (1.0 - filterStrength) +
+              colorFiltered[0] * filterStrength,
+          );
+          scratchFilterRgba[1] = clampByte(
+            originalRgba[1] * (1.0 - filterStrength) +
+              colorFiltered[1] * filterStrength,
+          );
+          scratchFilterRgba[2] = clampByte(
+            originalRgba[2] * (1.0 - filterStrength) +
+              colorFiltered[2] * filterStrength,
+          );
+        } else {
+          // 没有 filterStrength，直接应用滤镜颜色
+          scratchFilterRgba[0] = filterColorRgba[0];
+          scratchFilterRgba[1] = filterColorRgba[1];
+          scratchFilterRgba[2] = filterColorRgba[2];
+        }
+
+        if (overrideAlphaSet) {
+          scratchFilterRgba[3] = overrideAlphaValue;
+        } else if (
+          result.color instanceof Color ||
+          Array.isArray(result.color)
+        ) {
+          scratchFilterRgba[3] = filterColorRgba[3];
+        }
+        modified = true;
+      }
+
+      if (defined(result.tint)) {
+        const tint = CesiumMath.clamp(result.tint, 0.0, 1.0);
+        scratchFilterRgba[0] = clampByte(
+          scratchFilterRgba[0] * (1.0 - tint) + 255.0 * tint,
+        );
+        scratchFilterRgba[1] = clampByte(
+          scratchFilterRgba[1] * (1.0 - tint) + 255.0 * tint,
+        );
+        scratchFilterRgba[2] = clampByte(
+          scratchFilterRgba[2] * (1.0 - tint) + 255.0 * tint,
+        );
+        modified = true;
+      }
+
+      Color.fromBytes(
+        scratchFilterRgba[0],
+        scratchFilterRgba[1],
+        scratchFilterRgba[2],
+        scratchFilterRgba[3],
+        scratchFilterColor,
+      );
+
+      if (descriptor.once === true) {
+        descriptor.enabled = false;
+      }
+
+      if (defined(result.stop) ? result.stop : stopProcessing) {
+        break;
+      }
+    }
+
+    if (modified) {
+      colors[colorIndex] = scratchFilterRgba[0];
+      colors[colorIndex + 1] = scratchFilterRgba[1];
+      colors[colorIndex + 2] = scratchFilterRgba[2];
+      if (isRgba) {
+        colors[colorIndex + 3] = scratchFilterRgba[3];
+      }
+    }
+  }
 }
 
 /** A primitive that renders Gaussian splats.
@@ -145,31 +404,6 @@ function GaussianSplatPrimitive(options) {
    * @private
    */
   this._needsGaussianSplatTexture = true;
-
-  /**
-   * OUTLINE_PASS support - added for screen-space outline rendering
-   * Indicates whether the primitive is in outline rendering mode.
-   * Reference: PlayCanvas/supersplat outline implementation
-   * @type {boolean}
-   * @private
-   */
-  this._outlineMode = false;
-
-  /**
-   * State texture for managing splat selection/visibility states.
-   * Format: R8, where each byte represents splat state (bit 0=selected, bit 1=locked, bit 2=deleted)
-   * @type {undefined|Texture}
-   * @private
-   */
-  this._stateTexture = undefined;
-
-  /**
-   * State texture dimensions
-   * @type {number}
-   * @private
-   */
-  this._stateTextureWidth = 0;
-  this._stateTextureHeight = 0;
 
   /**
    * The previous view matrix used to determine if the primitive needs to be updated.
@@ -332,6 +566,35 @@ function GaussianSplatPrimitive(options) {
    * @private
    */
   this._sorterError = undefined;
+
+  /**
+   * PLY index mapping data for tracking original PLY point indices.
+   * @type {Array<Object>}
+   * @private
+   */
+  this._tilePlyIndexOffsets = [];
+
+  /**
+   * Map from PLY index to aggregate index.
+   * @type {Map<number, number>}
+   * @private
+   */
+  this._plyIndexToAggregateIndex = new Map();
+
+  /**
+   * Color modifications by PLY index.
+   * @type {Map<number, Array<number>>}
+   * @private
+   */
+  this._colorModifications = new Map();
+
+  /**
+   * Custom color filters supplied through the public Cesium3DTileset API.
+   * Each entry is an object with: { id, name, callback, enabled, priority, options, userData }.
+   * @type {Array<Object>}
+   * @private
+   */
+  this._customColorFilters = [];
 }
 
 Object.defineProperties(GaussianSplatPrimitive.prototype, {
@@ -419,6 +682,35 @@ GaussianSplatPrimitive.prototype.destroy = function () {
  */
 GaussianSplatPrimitive.prototype.isDestroyed = function () {
   return this._isDestroyed;
+};
+
+/**
+ * Get the PLY start index for a tile from its extras or compute from tileset.
+ * @param {Cesium3DTile} tile The tile to get PLY index for.
+ * @returns {number} The PLY start index for this tile.
+ * @private
+ */
+GaussianSplatPrimitive.prototype._getTilePlyStartIndex = function (tile) {
+  // 尝试从tile的extras属性中获取PLY索引范围（从tileset.json中读取）
+  if (defined(tile.extras) && defined(tile.extras.plyIndexRange)) {
+    const start = tile.extras.plyIndexRange.start;
+    if (defined(start) && typeof start === "number") {
+      return start;
+    }
+  }
+
+  // 如果tile有_header.extras（备用方法）
+  if (defined(tile._header) && defined(tile._header.extras)) {
+    const extras = tile._header.extras;
+    if (defined(extras.plyIndexRange) && defined(extras.plyIndexRange.start)) {
+      return extras.plyIndexRange.start;
+    }
+  }
+
+  // 作为fallback，尝试从已加载的tile中计算累积索引
+  // 这需要遍历tileset的所有tile来计算
+  // 暂时返回0，实际使用时应该根据tileset结构计算
+  return 0;
 };
 
 /**
@@ -560,12 +852,143 @@ GaussianSplatPrimitive.transformTile = function (tile) {
  */
 GaussianSplatPrimitive.generateSplatTexture = function (primitive, frameState) {
   primitive._gaussianSplatTexturePending = true;
+
+  // 复制颜色数组
+  const colors = new Uint8Array(primitive._colors);
+
+  // ========================================
+  // [方案1] 应用颜色修改（新方法）
+  // ========================================
+  if (primitive._colorModifications.size > 0) {
+    console.log(`\n[方案1-ColorMod] 开始应用颜色修改...`);
+    console.log(
+      `[方案1-ColorMod]   - 待修改数量: ${primitive._colorModifications.size}`,
+    );
+    console.log(`[方案1-ColorMod]   - 总 splat 数: ${primitive._numSplats}`);
+    console.log(
+      `[方案1-ColorMod]   - PLY 索引数组存在: ${defined(primitive._plyIndicesAggregate)}`,
+    );
+
+    const isRgba = colors.length === primitive._numSplats * 4;
+    const componentsPerColor = isRgba ? 4 : 3;
+    let appliedCount = 0;
+    let notFoundCount = 0;
+
+    if (defined(primitive._plyIndicesAggregate)) {
+      // [方案1] 新方法：遍历所有 splat，查找需要修改颜色的
+      console.log(`[方案1-ColorMod] 使用新方法（基于聚合 PLY 索引数组）`);
+
+      for (
+        let aggregateIndex = 0;
+        aggregateIndex < primitive._numSplats;
+        aggregateIndex++
+      ) {
+        const plyIndex = primitive._plyIndicesAggregate[aggregateIndex];
+
+        // 检查是否有颜色修改
+        if (primitive._colorModifications.has(plyIndex)) {
+          const modifiedColor = primitive._colorModifications.get(plyIndex);
+          const colorIndex = aggregateIndex * componentsPerColor;
+
+          colors[colorIndex] = modifiedColor[0]; // R
+          colors[colorIndex + 1] = modifiedColor[1]; // G
+          colors[colorIndex + 2] = modifiedColor[2]; // B
+          if (isRgba && modifiedColor.length > 3) {
+            colors[colorIndex + 3] = modifiedColor[3]; // A
+          }
+
+          appliedCount++;
+
+          // 调试：输出前几个修改
+          if (appliedCount <= 5) {
+            console.log(
+              `[方案1-ColorMod]   修改 ${appliedCount}: aggregateIndex=${aggregateIndex}, plyIndex=${plyIndex}, color=[${modifiedColor.join(",")}]`,
+            );
+          }
+        }
+      }
+
+      console.log(
+        `[方案1-ColorMod] ✓ 颜色修改应用完成: ${appliedCount} 个成功`,
+      );
+    } else {
+      // 回退到旧方法（使用映射）
+      console.warn(
+        `[方案1-ColorMod] ⚠️ PLY 索引数组不存在，使用旧方法（映射）`,
+      );
+
+      for (const [plyIndex, modifiedColor] of primitive._colorModifications) {
+        const aggregateIndex =
+          primitive._plyIndexToAggregateIndex.get(plyIndex);
+        if (defined(aggregateIndex) && aggregateIndex < primitive._numSplats) {
+          const colorIndex = aggregateIndex * componentsPerColor;
+          colors[colorIndex] = modifiedColor[0]; // R
+          colors[colorIndex + 1] = modifiedColor[1]; // G
+          colors[colorIndex + 2] = modifiedColor[2]; // B
+          if (isRgba && modifiedColor.length > 3) {
+            colors[colorIndex + 3] = modifiedColor[3]; // A
+          }
+          appliedCount++;
+        } else {
+          notFoundCount++;
+        }
+      }
+
+      console.log(
+        `[方案1-ColorMod] 颜色修改应用: ${appliedCount} 个成功, ${notFoundCount} 个失败`,
+      );
+    }
+  }
+
+  // ========================================
+  // 自定义滤镜（颜色处理管线）
+  // ========================================
+  if (
+    defined(primitive._customColorFilters) &&
+    primitive._customColorFilters.length > 0
+  ) {
+    const componentsPerColor =
+      colors.length === primitive._numSplats * 4 ? 4 : 3;
+    const isRgba = componentsPerColor === 4;
+    applyCustomColorFilters(primitive, colors, componentsPerColor, isRgba);
+  }
+
+  // ========================================
+  // [方案1] 传递 PLY 索引给纹理生成器
+  // ========================================
+  console.log(`\n[方案1] 准备生成纹理...`);
+  console.log(`[方案1]   - splat 数量: ${primitive._numSplats}`);
+  console.log(
+    `[方案1]   - PLY 索引数组存在: ${defined(primitive._plyIndicesAggregate)}`,
+  );
+  if (defined(primitive._plyIndicesAggregate)) {
+    console.log(
+      `[方案1]   - PLY 索引数组长度: ${primitive._plyIndicesAggregate.length}`,
+    );
+    console.log(
+      `[方案1]   - PLY 索引前5个: [${Array.from(primitive._plyIndicesAggregate.slice(0, 5)).join(", ")}]`,
+    );
+  }
+
+  // [方案1] 创建 PLY 索引数组的副本，避免 ArrayBuffer 被 transfer 后分离
+  // 注意：我们需要保留主线程的副本，因为后续可能需要重新生成纹理
+  const plyIndicesCopy = defined(primitive._plyIndicesAggregate)
+    ? new Uint32Array(primitive._plyIndicesAggregate)
+    : undefined;
+
+  if (defined(plyIndicesCopy)) {
+    console.log(
+      `[方案1]   ✓ PLY 索引副本已创建，长度: ${plyIndicesCopy.length}`,
+    );
+  }
+
   const promise = GaussianSplatTextureGenerator.generateFromAttributes({
     attributes: {
       positions: new Float32Array(primitive._positions),
       scales: new Float32Array(primitive._scales),
       rotations: new Float32Array(primitive._rotations),
-      colors: new Uint8Array(primitive._colors),
+      colors: colors, // 使用修改后的颜色
+      plyIndices: plyIndicesCopy, // [方案1] 使用副本，避免原数组的 buffer 被分离
     },
     count: primitive._numSplats,
   });
@@ -710,81 +1133,6 @@ GaussianSplatPrimitive.buildGSplatDrawCommand = function (
     return primitive._sphericalHarmonicsDegree;
   };
 
-  // OUTLINE_PASS support - add state texture uniforms when in outline mode
-  // Reference: PlayCanvas/supersplat outline implementation
-  console.log("[buildGSplatDrawCommand] 检查 OUTLINE_PASS 条件:");
-  console.log("- primitive._outlineMode:", primitive._outlineMode);
-  console.log("- primitive._stateTexture:", primitive._stateTexture);
-  console.log(
-    "- defined(primitive._stateTexture):",
-    defined(primitive._stateTexture),
-  );
-  console.log(
-    "- 条件结果:",
-    primitive._outlineMode && defined(primitive._stateTexture),
-  );
-
-  if (primitive._outlineMode && defined(primitive._stateTexture)) {
-    console.log("✅ 添加 OUTLINE_PASS define 和 uniforms");
-
-    // 调试：检查 addDefine 之前的状态
-    console.log(
-      "[addDefine 之前] VS defineLines:",
-      shaderBuilder._vertexShaderParts.defineLines,
-    );
-    console.log(
-      "[addDefine 之前] FS defineLines:",
-      shaderBuilder._fragmentShaderParts.defineLines,
-    );
-
-    shaderBuilder.addDefine("OUTLINE_PASS");
-
-    // 调试：检查 addDefine 之后的状态
-    console.log(
-      "[addDefine 之后] VS defineLines:",
-      shaderBuilder._vertexShaderParts.defineLines,
-    );
-    console.log(
-      "[addDefine 之后] FS defineLines:",
-      shaderBuilder._fragmentShaderParts.defineLines,
-    );
-    console.log(
-      "[addDefine 之后] VS 包含 OUTLINE_PASS:",
-      shaderBuilder._vertexShaderParts.defineLines.includes("OUTLINE_PASS"),
-    );
-    console.log(
-      "[addDefine 之后] FS 包含 OUTLINE_PASS:",
-      shaderBuilder._fragmentShaderParts.defineLines.includes("OUTLINE_PASS"),
-    );
-
-    shaderBuilder.addUniform(
-      "highp sampler2D",
-      "u_splatStateTexture",
-      ShaderDestination.VERTEX,
-    );
-
-    shaderBuilder.addUniform(
-      "vec2",
-      "u_stateTextureSize",
-      ShaderDestination.VERTEX,
-    );
-
-    uniformMap.u_splatStateTexture = function () {
-      return primitive._stateTexture;
-    };
-
-    uniformMap.u_stateTextureSize = function () {
-      return new Cartesian2(
-        primitive._stateTextureWidth,
-        primitive._stateTextureHeight,
-      );
-    };
-
-    console.log("✅ OUTLINE_PASS 支持已添加");
-  } else {
-    console.log("❌ OUTLINE_PASS 条件检查失败，未添加");
-  }
-
   uniformMap.u_cameraPositionWC = function () {
     return Cartesian3.clone(frameState.camera.positionWC);
   };
@@ -813,55 +1161,12 @@ GaussianSplatPrimitive.buildGSplatDrawCommand = function (
   shaderBuilder.addVertexLines(GaussianSplatVS);
   shaderBuilder.addFragmentLines(GaussianSplatFS);
 
-  // 调试：检查 shaderBuilder 的 define 列表
-  if (primitive._outlineMode) {
-    console.log(
-      "[buildGSplatDrawCommand] 在 buildShaderProgram 之前检查 shaderBuilder:",
-    );
-    console.log(
-      "- VS defineLines:",
-      shaderBuilder._vertexShaderParts.defineLines,
-    );
-    console.log(
-      "- FS defineLines:",
-      shaderBuilder._fragmentShaderParts.defineLines,
-    );
-    console.log(
-      "- VS 包含 OUTLINE_PASS:",
-      shaderBuilder._vertexShaderParts.defineLines.includes("OUTLINE_PASS"),
-    );
-    console.log(
-      "- FS 包含 OUTLINE_PASS:",
-      shaderBuilder._fragmentShaderParts.defineLines.includes("OUTLINE_PASS"),
-    );
-  }
-
   const shaderProgram = shaderBuilder.buildShaderProgram(frameState.context);
 
-  // 调试：检查编译后的 shader program
-  if (primitive._outlineMode) {
-    console.log("[buildGSplatDrawCommand] 编译后的 shader program:");
-    console.log("- VS defines:", shaderProgram._vertexShaderSource.defines);
-    console.log("- FS defines:", shaderProgram._fragmentShaderSource.defines);
-    console.log(
-      "- VS 包含 OUTLINE_PASS:",
-      shaderProgram._vertexShaderSource.defines.includes("OUTLINE_PASS"),
-    );
-    console.log(
-      "- FS 包含 OUTLINE_PASS:",
-      shaderProgram._fragmentShaderSource.defines.includes("OUTLINE_PASS"),
-    );
-  }
   let renderState = clone(
     RenderState.fromCache(renderResources.renderStateOptions),
     true,
   );
-
-  // OUTLINE_PASS: 禁用深度测试，确保所有 splat 都能渲染
-  if (primitive._outlineMode) {
-    renderState.depthTest.enabled = false;
-    renderState.depthMask = false;
-  }
 
   renderState.cull.face = ModelUtility.getCullFace(
     tileset.modelMatrix,
@@ -1007,6 +1312,137 @@ GaussianSplatPrimitive.prototype.update = function (frameState) {
         (total, tile) => total + tile.content.pointsLength,
         0,
       );
+
+      // 建立PLY索引映射
+      this._tilePlyIndexOffsets = [];
+      this._plyIndexToAggregateIndex.clear();
+      let aggregateIndexOffset = 0;
+
+      for (const tile of tiles) {
+        const tilePointsLength = tile.content.pointsLength;
+        const plyIndexArray = tile.content.plyIndices;
+
+        console.log(`处理 tile: ${tile._header.uri || "root"}`);
+        console.log(`  - pointsLength: ${tilePointsLength}`);
+        console.log(`  - plyIndices 存在: ${defined(plyIndexArray)}`);
+        if (defined(plyIndexArray)) {
+          console.log(`  - plyIndices 长度: ${plyIndexArray.length}`);
+          console.log(
+            `  - plyIndices 前10个: [${Array.from(plyIndexArray.slice(0, 10)).join(", ")}]`,
+          );
+        }
+
+        // 优先使用 _PLY_INDEX attribute 建立精确映射
+        if (
+          defined(plyIndexArray) &&
+          plyIndexArray.length === tilePointsLength
+        ) {
+          // 使用 _PLY_INDEX attribute 建立精确映射
+          for (let i = 0; i < tilePointsLength; i++) {
+            const plyIndex = plyIndexArray[i];
+            const aggregateIndex = aggregateIndexOffset + i;
+            this._plyIndexToAggregateIndex.set(plyIndex, aggregateIndex);
+          }
+
+          // 计算 PLY 索引范围（用于记录）
+          let minIndex = Number.POSITIVE_INFINITY;
+          let maxIndex = Number.NEGATIVE_INFINITY;
+          for (let i = 0; i < tilePointsLength; i++) {
+            const plyIndex = plyIndexArray[i];
+            if (plyIndex < minIndex) {
+              minIndex = plyIndex;
+            }
+            if (plyIndex > maxIndex) {
+              maxIndex = plyIndex;
+            }
+          }
+
+          this._tilePlyIndexOffsets.push({
+            tile: tile,
+            plyStartIndex: minIndex,
+            plyEndIndex: maxIndex,
+            aggregateStartIndex: aggregateIndexOffset,
+            aggregateEndIndex: aggregateIndexOffset + tilePointsLength - 1,
+          });
+
+          console.log(
+            `Tile ${tile._header.uri || "root"}: 使用 _PLY_INDEX attribute, 范围 [${minIndex}, ${maxIndex}], 点数 ${tilePointsLength}`,
+          );
+        } else {
+          // 回退到旧的连续索引假设
+          const plyStartIndex = this._getTilePlyStartIndex(tile);
+          const plyEndIndex = plyStartIndex + tilePointsLength - 1;
+
+          this._tilePlyIndexOffsets.push({
+            tile: tile,
+            plyStartIndex: plyStartIndex,
+            plyEndIndex: plyEndIndex,
+            aggregateStartIndex: aggregateIndexOffset,
+            aggregateEndIndex: aggregateIndexOffset + tilePointsLength - 1,
+          });
+
+          // 建立PLY索引到聚合索引的映射
+          // 假设tile内的点按顺序对应PLY索引（从plyStartIndex开始）
+          for (let i = 0; i < tilePointsLength; i++) {
+            const plyIndex = plyStartIndex + i;
+            const aggregateIndex = aggregateIndexOffset + i;
+            this._plyIndexToAggregateIndex.set(plyIndex, aggregateIndex);
+          }
+
+          console.warn(
+            `Tile ${tile._header.uri || "root"}: 未找到 _PLY_INDEX attribute, 使用连续索引假设, 范围 [${plyStartIndex}, ${plyEndIndex}]`,
+          );
+        }
+
+        aggregateIndexOffset += tilePointsLength;
+      }
+
+      // ========================================
+      // [方案1] 聚合 PLY 索引数组
+      // ========================================
+      console.log(`\n[方案1] 开始聚合 PLY 索引数组...`);
+      this._plyIndicesAggregate = new Uint32Array(totalElements);
+      let plyIndexOffset = 0;
+
+      for (const tile of tiles) {
+        const content = tile.content;
+        const tilePointsLength = content.pointsLength;
+
+        if (
+          defined(content.plyIndices) &&
+          content.plyIndices.length === tilePointsLength
+        ) {
+          // 使用瓦片的 PLY 索引数组
+          this._plyIndicesAggregate.set(content.plyIndices, plyIndexOffset);
+          console.log(
+            `[方案1] 瓦片 ${tile._header.uri || "root"}: 复制 ${tilePointsLength} 个 PLY 索引`,
+          );
+          console.log(`[方案1]   - 偏移: ${plyIndexOffset}`);
+          console.log(
+            `[方案1]   - 前5个: [${Array.from(content.plyIndices.slice(0, 5)).join(", ")}]`,
+          );
+        } else {
+          // 回退：使用连续索引
+          console.warn(
+            `[方案1] 瓦片 ${tile._header.uri || "root"}: 未找到 PLY 索引，使用连续索引`,
+          );
+          for (let i = 0; i < tilePointsLength; i++) {
+            this._plyIndicesAggregate[plyIndexOffset + i] = plyIndexOffset + i;
+          }
+        }
+
+        plyIndexOffset += tilePointsLength;
+      }
+
+      console.log(`[方案1] ✓ PLY 索引聚合完成:`);
+      console.log(`[方案1]   - 总数: ${this._plyIndicesAggregate.length}`);
+      console.log(
+        `[方案1]   - 前10个: [${Array.from(this._plyIndicesAggregate.slice(0, 10)).join(", ")}]`,
+      );
+      console.log(
+        `[方案1]   - 最后10个: [${Array.from(this._plyIndicesAggregate.slice(-10)).join(", ")}]`,
+      );
+
       const aggregateAttributeValues = (
         componentDatatype,
         getAttributeCallback,
