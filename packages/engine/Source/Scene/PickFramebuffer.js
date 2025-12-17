@@ -59,6 +59,17 @@ PickFramebuffer.prototype.end = function (screenSpaceRectangle, limit = 1) {
   const width = screenSpaceRectangle.width ?? 1.0;
   const height = screenSpaceRectangle.height ?? 1.0;
 
+  //>>includeStart('debug', pragmas.debug);
+  console.log("[拾取流程] PickFramebuffer.end() 开始读取像素");
+  console.log("  - screenSpaceRectangle:", {
+    x: screenSpaceRectangle.x,
+    y: screenSpaceRectangle.y,
+    width: width,
+    height: height,
+  });
+  console.log("  - limit:", limit);
+  //>>includeEnd('debug');
+
   const context = this._context;
   const pixels = context.readPixels({
     x: screenSpaceRectangle.x,
@@ -84,6 +95,9 @@ PickFramebuffer.prototype.end = function (screenSpaceRectangle, limit = 1) {
   // The region does not have to square and the dimensions do not have to be odd, but
   // loop iterations would be wasted. Prefer square regions where the size is odd.
   const objects = new Set();
+  let pixelCheckCount = 0;
+  let pickColorFoundCount = 0;
+
   for (let i = 0; i < length; ++i) {
     if (
       -halfWidth <= x &&
@@ -91,6 +105,7 @@ PickFramebuffer.prototype.end = function (screenSpaceRectangle, limit = 1) {
       -halfHeight <= y &&
       y <= halfHeight
     ) {
+      pixelCheckCount++;
       const index = 4 * ((halfHeight - y) * width + x + halfWidth);
 
       const pickColor = Color.bytesToRgba(
@@ -102,6 +117,18 @@ PickFramebuffer.prototype.end = function (screenSpaceRectangle, limit = 1) {
 
       const object = context.getObjectByPickColor(pickColor);
       if (defined(object)) {
+        pickColorFoundCount++;
+        //>>includeStart('debug', pragmas.debug);
+        if (objects.size === 0) {
+          console.log("[拾取流程] 找到第一个拾取对象");
+          console.log("  - pickColor:", pickColor);
+          console.log("  - object:", {
+            primitive:
+              object.primitive?.constructor?.name || typeof object.primitive,
+            content: object.content?.constructor?.name || typeof object.content,
+          });
+        }
+        //>>includeEnd('debug');
         objects.add(object);
         if (objects.size >= limit) {
           break;
@@ -120,6 +147,14 @@ PickFramebuffer.prototype.end = function (screenSpaceRectangle, limit = 1) {
     x += dx;
     y += dy;
   }
+
+  //>>includeStart('debug', pragmas.debug);
+  console.log("[拾取流程] PickFramebuffer.end() 完成");
+  console.log("  - 检查像素数:", pixelCheckCount);
+  console.log("  - 找到 pickColor 数:", pickColorFoundCount);
+  console.log("  - 返回对象数:", objects.size);
+  //>>includeEnd('debug');
+
   return [...objects];
 };
 

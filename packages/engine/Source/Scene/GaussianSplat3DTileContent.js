@@ -899,6 +899,15 @@ GaussianSplat3DTileContent.prototype.applyStyle = function (style) {};
  * @private
  */
 GaussianSplat3DTileContent.prototype.pick = function (ray, frameState, result) {
+  //>>includeStart('debug', pragmas.debug);
+  console.log("[拾取流程] GaussianSplat3DTileContent.pick() 被调用");
+  console.log("  - 注意: 高斯溅射不支持射线拾取，返回 undefined");
+  console.log("  - tile:", this._tile ? "存在" : "不存在");
+  console.log("  - tileset:", this._tileset ? "存在" : "不存在");
+  if (this._tile) {
+    console.log("  - tile.content.url:", this._tile.content?.url || "N/A");
+  }
+  //>>includeEnd('debug');
   return undefined;
 };
 /**

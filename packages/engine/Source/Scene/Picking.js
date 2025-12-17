@@ -284,6 +284,9 @@ Picking.prototype.pick = function (
 ) {
   //>>includeStart('debug', pragmas.debug);
   Check.defined("windowPosition", windowPosition);
+  console.log("[拾取流程] Picking.pick() 开始执行");
+  console.log("  - windowPosition:", windowPosition);
+  console.log("  - width:", width, "height:", height, "limit:", limit);
   //>>includeEnd('debug');
 
   const { context, frameState, defaultView } = scene;
@@ -312,6 +315,17 @@ Picking.prototype.pick = function (
     scratchRectangle,
   );
 
+  //>>includeStart('debug', pragmas.debug);
+  console.log("[拾取流程] 坐标转换完成");
+  console.log("  - drawingBufferPosition:", drawingBufferPosition);
+  console.log("  - drawingBufferRectangle:", {
+    x: drawingBufferRectangle.x,
+    y: drawingBufferRectangle.y,
+    width: drawingBufferRectangle.width,
+    height: drawingBufferRectangle.height,
+  });
+  //>>includeEnd('debug');
+
   scene.jobScheduler.disableThisFrame();
 
   scene.updateFrameState();
@@ -326,16 +340,43 @@ Picking.prototype.pick = function (
   frameState.passes.pick = true;
   frameState.tilesetPassState = pickTilesetPassState;
 
+  //>>includeStart('debug', pragmas.debug);
+  console.log("[拾取流程] 设置拾取状态");
+  console.log("  - passes.pick:", frameState.passes.pick);
+  console.log("  - tilesetPassState:", frameState.tilesetPassState?.pass);
+  //>>includeEnd('debug');
+
   context.uniformState.update(frameState);
 
   scene.updateEnvironment();
+
+  //>>includeStart('debug', pragmas.debug);
+  console.log("[拾取流程] 开始拾取渲染");
+  //>>includeEnd('debug');
 
   passState = pickFramebuffer.begin(drawingBufferRectangle, viewport);
 
   scene.updateAndExecuteCommands(passState, scratchColorZero);
   scene.resolveFramebuffers(passState);
 
+  //>>includeStart('debug', pragmas.debug);
+  console.log("[拾取流程] 拾取渲染完成，读取结果");
+  //>>includeEnd('debug');
+
   const pickedObjects = pickFramebuffer.end(drawingBufferRectangle, limit);
+
+  //>>includeStart('debug', pragmas.debug);
+  console.log("[拾取流程] Picking.pick() 返回结果");
+  console.log("  - 拾取对象数量:", pickedObjects.length);
+  pickedObjects.forEach((obj, index) => {
+    console.log(`  - 对象 ${index}:`, {
+      primitive: obj.primitive?.constructor?.name || typeof obj.primitive,
+      content: obj.content?.constructor?.name || typeof obj.content,
+      id: obj.id,
+    });
+  });
+  //>>includeEnd('debug');
+
   context.endFrame();
   return pickedObjects;
 };

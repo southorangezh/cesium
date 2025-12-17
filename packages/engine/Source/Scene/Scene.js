@@ -45,6 +45,7 @@ import BrdfLutGenerator from "./BrdfLutGenerator.js";
 import Camera from "./Camera.js";
 import Cesium3DTilePass from "./Cesium3DTilePass.js";
 import Cesium3DTilePassState from "./Cesium3DTilePassState.js";
+import Cesium3DTileFeature from "./Cesium3DTileFeature.js";
 import CreditDisplay from "./CreditDisplay.js";
 import DebugCameraPrimitive from "./DebugCameraPrimitive.js";
 import DepthPlane from "./DepthPlane.js";
@@ -4513,8 +4514,44 @@ Scene.prototype.clampLineWidth = function (width) {
  * @returns {object | undefined} Object containing the picked primitive or <code>undefined</code> if nothing is at the location.
  */
 Scene.prototype.pick = function (windowPosition, width, height) {
+  //>>includeStart('debug', pragmas.debug);
+  console.log("[拾取流程] Scene.pick() 调用开始");
+  console.log("  - windowPosition:", windowPosition);
+  console.log("  - width:", width, "height:", height);
+  //>>includeEnd('debug');
+
   // Picking one object, result is either [object] or []
-  return this._picking.pick(this, windowPosition, width, height, 1)[0];
+  const result = this._picking.pick(this, windowPosition, width, height, 1)[0];
+
+  //>>includeStart('debug', pragmas.debug);
+  if (result) {
+    console.log("[拾取流程] Scene.pick() 返回结果:");
+    console.log(
+      "  - primitive:",
+      result.primitive?.constructor?.name || typeof result.primitive,
+    );
+    console.log(
+      "  - content:",
+      result.content?.constructor?.name || typeof result.content,
+    );
+    if (result.content) {
+      console.log("  - content.tile:", result.content.tile ? "存在" : "不存在");
+      console.log(
+        "  - content.tileset:",
+        result.content.tileset ? "存在" : "不存在",
+      );
+    }
+    if (result.content instanceof Cesium3DTileFeature) {
+      console.log("  - 类型: Cesium3DTileFeature");
+    } else if (result.content) {
+      console.log("  - 类型: Cesium3DTileContent");
+    }
+  } else {
+    console.log("[拾取流程] Scene.pick() 未拾取到任何对象");
+  }
+  //>>includeEnd('debug');
+
+  return result;
 };
 
 /**

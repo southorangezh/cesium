@@ -96,12 +96,27 @@ function buildPickObject(renderResources, instanceId) {
       primitive: content.tileset,
       detail: detailPickObject,
     };
+    //>>includeStart('debug', pragmas.debug);
+    console.log("[拾取流程] buildPickObject() 构建 3D Tiles 拾取对象");
+    console.log(
+      "  - content 类型:",
+      content?.constructor?.name || typeof content,
+    );
+    console.log("  - tileset:", content?.tileset ? "存在" : "不存在");
+    if (content) {
+      console.log("  - content.tile:", content.tile ? "存在" : "不存在");
+    }
+    //>>includeEnd('debug');
   } else {
     // For models, the model itself is returned as the primitive, with the detail pick object under the detail key.
     pickObject = {
       primitive: model,
       detail: detailPickObject,
     };
+    //>>includeStart('debug', pragmas.debug);
+    console.log("[拾取流程] buildPickObject() 构建模型拾取对象");
+    console.log("  - model 类型:", model?.constructor?.name || typeof model);
+    //>>includeEnd('debug');
   }
 
   pickObject.id = model.id;
@@ -109,6 +124,9 @@ function buildPickObject(renderResources, instanceId) {
   if (defined(instanceId)) {
     // For instanced models, an instanceId property is added to the pick object.
     pickObject.instanceId = instanceId;
+    //>>includeStart('debug', pragmas.debug);
+    console.log("[拾取流程] buildPickObject() 添加实例 ID:", instanceId);
+    //>>includeEnd('debug');
   }
 
   return pickObject;

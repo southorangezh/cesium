@@ -198,4 +198,14 @@ void main() {
     v_splatColor.rgb += evaluateSH(texIdx, viewDirModel).rgb;
 #endif
     v_splitDirection = u_splitDirection;
+#if defined(HAS_SPLAT_STATE)
+    // Read splat state from state texture
+    // State texture uses same layout as splat texture (same width/height calculation)
+    // Note: Texture format is RED/LUMINANCE (non-integer), so values are normalized 0.0-1.0
+    ivec2 stateCoord = ivec2(int(texIdx) % int(u_stateTextureWidth), int(texIdx) / int(u_stateTextureWidth));
+    float stateNormalized = texelFetch(u_splatStateTexture, stateCoord, 0).r;
+    // Convert normalized value (0.0-1.0) back to integer state (0-255)
+    uint vertexState = uint(stateNormalized * 255.0 + 0.5);
+    v_splatState = float(vertexState);
+#endif
 }
