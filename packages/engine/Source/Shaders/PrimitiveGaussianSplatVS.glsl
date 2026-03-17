@@ -169,28 +169,74 @@ void main() {
 
     vec4 covVectors = calcCovVectors(splatViewPos.xyz, Vrk);
 
+#ifdef PICK_PASS
+    // In pick pass, completely disable clipping to ensure all splats are rendered
+    // This is critical for picking to work - we want to pick any splat that could be visible
+    // Skip the clipping test entirely
+#else
     float clip = 1.2 * clipPosition.w;
     if (clipPosition.z < -clip || clipPosition.x < -clip || clipPosition.x > clip ||
         clipPosition.y < -clip || clipPosition.y > clip) {
         gl_Position = vec4(0.0, 0.0, 2.0, 1.0);
         return;
     }
+#endif
 
     gl_Position = clipPosition;
 
+#ifdef PICK_PASS
+    // In pick pass, skip the size check to ensure all visible splats are rendered
+    // This allows picking even for very small splats
+#else
     if (dot(covVectors.xy, covVectors.xy) < 4.0 && dot(covVectors.zw, covVectors.zw) < 4.0) {
         gl_Position = discardVec;
         return;
     }
+#endif
 
     // 计算 quad corner
     vec2 corner = vec2((gl_VertexID << 1) & 2, gl_VertexID & 2) - 1.;
 
+#ifdef PICK_PASS
+    // In pick pass, ensure quad has minimum size to guarantee at least one pixel is rendered
+    // This is critical for picking to work correctly
+    vec2 quadSize = (corner.x * covVectors.xy + corner.y * covVectors.zw) / czm_viewport.zw * gl_Position.w;
+    // Calculate minimum quad size (at least 2 pixels to ensure coverage)
+    vec2 minQuadSize = vec2(2.0, 2.0) / czm_viewport.zw * gl_Position.w;
+    // Ensure quad size is at least the minimum in each direction
+    if (abs(quadSize.x) < abs(minQuadSize.x)) {
+        quadSize.x = minQuadSize.x * sign(quadSize.x);
+        if (quadSize.x == 0.0) quadSize.x = minQuadSize.x;
+    }
+    if (abs(quadSize.y) < abs(minQuadSize.y)) {
+        quadSize.y = minQuadSize.y * sign(quadSize.y);
+        if (quadSize.y == 0.0) quadSize.y = minQuadSize.y;
+    }
+    gl_Position += vec4(quadSize, 0, 0);
+#else
     gl_Position += vec4((corner.x * covVectors.xy + corner.y * covVectors.zw) / czm_viewport.zw * gl_Position.w, 0, 0);
+#endif
     gl_Position.z = clamp(gl_Position.z, -abs(gl_Position.w), abs(gl_Position.w));
 
     v_vertPos = corner ;
     v_splatColor = vec4(covariance.w & 0xffu, (covariance.w >> 8) & 0xffu, (covariance.w >> 16) & 0xffu, (covariance.w >> 24) & 0xffu) / 255.0;
+    
+    // ========================================
+    // GPU Picking: Encode plyIndex as color
+    // ========================================
+#ifdef PICK_PASS
+    // Encode plyIndex into RGBA (32-bit integer, 8 bits per channel)
+    // plyIndex is already available from posData.w
+    // Note: plyIndex should never be 0 for valid splats (0 is reserved for background)
+    // If plyIndex is 0, we encode it as 0 (all channels 0) which will be detected as background
+    v_pickColor = vec4(
+        float((plyIndex) & 0xFFu) / 255.0,
+        float((plyIndex >> 8u) & 0xFFu) / 255.0,
+        float((plyIndex >> 16u) & 0xFFu) / 255.0,
+        float((plyIndex >> 24u) & 0xFFu) / 255.0
+    );
+#endif
+    
 #if defined(HAS_SPHERICAL_HARMONICS)
     vec4 splatWC = czm_inverseView * splatViewPos;
     vec3 viewDirModel = normalize(u_inverseModelRotation * (splatWC.xyz - u_cameraPositionWC.xyz));

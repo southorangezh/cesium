@@ -6,6 +6,14 @@
 //
 
 void main() {
+    // ========================================
+    // GPU Picking: Output encoded plyIndex
+    // ========================================
+#ifdef PICK_PASS
+    // In pick pass, directly output the encoded plyIndex color
+    out_FragColor = v_pickColor;
+    return;
+#endif
     if (v_splitDirection < 0.0 && gl_FragCoord.x > czm_splitPosition) discard;
     if (v_splitDirection > 0.0 && gl_FragCoord.x < czm_splitPosition) discard;
 

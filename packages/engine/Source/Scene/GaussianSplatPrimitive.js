@@ -40,6 +40,11 @@ import Transforms from "../Core/Transforms.js";
 import Color from "../Core/Color.js";
 import CesiumMath from "../Core/Math.js";
 import SceneTransforms from "./SceneTransforms.js";
+import Cartographic from "../Core/Cartographic.js";
+import Ellipsoid from "../Core/Ellipsoid.js";
+import Cartesian4 from "../Core/Cartesian4.js";
+import Ray from "../Core/Ray.js";
+import GaussianSplatOctree from "./GaussianSplatOctree.js";
 
 const scratchMatrix4A = new Matrix4();
 const scratchMatrix4B = new Matrix4();
@@ -52,6 +57,44 @@ const scratchPickDrawingBuffer = new Cartesian2();
 const scratchPickProjected = new Cartesian2();
 const scratchPickCartesian = new Cartesian3();
 const scratchPickWorldPosition = new Cartesian3();
+const scratchPickViewPosition = new Cartesian3();
+const scratchPickRay = new Ray();
+const scratchPickRayTL = new Ray();
+const scratchPickRayTR = new Ray();
+const scratchPickRayBL = new Ray();
+const scratchPickRayBR = new Ray();
+const scratchPickWorldToRoot = new Matrix4();
+const scratchPickRayEndWorld = new Cartesian3();
+const scratchPickRayOriginRoot = new Cartesian3();
+const scratchPickRayEndRoot = new Cartesian3();
+const scratchPickRayDirRoot = new Cartesian3();
+const scratchPickDirCenterRoot = new Cartesian3();
+const scratchPickDirTLRoot = new Cartesian3();
+const scratchPickDirTRRoot = new Cartesian3();
+const scratchPickDirBLRoot = new Cartesian3();
+const scratchPickDirBRRoot = new Cartesian3();
+const scratchPickPlaneNear = new Cartesian4();
+const scratchPickPlaneLeft = new Cartesian4();
+const scratchPickPlaneRight = new Cartesian4();
+const scratchPickPlaneTop = new Cartesian4();
+const scratchPickPlaneBottom = new Cartesian4();
+const scratchPickPlaneNormal = new Cartesian3();
+const scratchPickCross = new Cartesian3();
+const scratchCandidateIndices = [];
+const scratchPickCornerTL = new Cartesian2();
+const scratchPickCornerTR = new Cartesian2();
+const scratchPickCornerBL = new Cartesian2();
+const scratchPickCornerBR = new Cartesian2();
+// CPU picking scratch (avoid per-call allocations)
+const PICK_TOP_K = 16;
+// When multiple splats are very close to the cursor, use ray-depth to avoid picking through to the back side.
+// Larger values reduce "picking through" but can slightly reduce how "snappy" the pick follows the cursor.
+const PICK_PIXEL_TIE_EPSILON = 2.0; // pixels in drawing-buffer space
+const PICK_PIXEL_TIE_EPSILON_SQ = PICK_PIXEL_TIE_EPSILON * PICK_PIXEL_TIE_EPSILON;
+const scratchPickTopKIndices = new Array(PICK_TOP_K);
+const scratchPickTopKDistanceSq = new Float64Array(PICK_TOP_K);
+// Stores ray depth (t along pick ray, smaller => closer to camera) for each Top-K candidate.
+const scratchPickTopKRayT = new Float64Array(PICK_TOP_K);
 const outlineClearColor = new Color(0.0, 0.0, 0.0, 0.0);
 
 const OutlineCompositeFS = `
@@ -308,6 +351,24 @@ function updateOutlineFramebuffer(primitive, frameState) {
     primitive._outlineFramebuffer.framebuffer;
 }
 
+function destroyPickResources(primitive) {
+  if (defined(primitive._pickFramebuffer)) {
+    primitive._pickFramebuffer.destroy();
+    primitive._pickFramebuffer = undefined;
+  }
+  primitive._pickTexture = undefined;
+  primitive._pickDrawCommand = undefined;
+  primitive._pickClearCommand = undefined;
+}
+
+function destroySplatOctree(primitive) {
+  if (defined(primitive._splatOctree) && typeof primitive._splatOctree.destroy === "function") {
+    primitive._splatOctree.destroy();
+  }
+  primitive._splatOctree = undefined;
+  primitive._splatOctreeDirty = true;
+}
+
 function destroyOutlineResources(primitive) {
   if (defined(primitive._outlineFramebuffer)) {
     primitive._outlineFramebuffer.destroy();
@@ -326,6 +387,111 @@ function destroyOutlineResources(primitive) {
   primitive._boundaryInstanceCount = 0;
   primitive._outlineRingCommand = undefined;
   primitive._outlineBoundaryStats = undefined;
+}
+
+function setPlaneFromOriginAndNormal(outPlane, origin, normal) {
+  // Plane format: Cartesian4 (nx, ny, nz, d) where n·x + d = 0
+  outPlane.x = normal.x;
+  outPlane.y = normal.y;
+  outPlane.z = normal.z;
+  outPlane.w = -(normal.x * origin.x + normal.y * origin.y + normal.z * origin.z);
+}
+
+function computeSidePlane(outPlane, origin, dirA, dirB, dirCenter) {
+  // normal = cross(dirA, dirB); ensure it points inward (toward dirCenter)
+  Cartesian3.cross(dirA, dirB, scratchPickCross);
+  const mag = Cartesian3.magnitude(scratchPickCross);
+  if (mag <= 0.0) {
+    outPlane.x = 0.0;
+    outPlane.y = 0.0;
+    outPlane.z = 0.0;
+    outPlane.w = 0.0;
+    return;
+  }
+  Cartesian3.divideByScalar(scratchPickCross, mag, scratchPickPlaneNormal);
+
+  if (Cartesian3.dot(scratchPickPlaneNormal, dirCenter) < 0.0) {
+    Cartesian3.negate(scratchPickPlaneNormal, scratchPickPlaneNormal);
+  }
+
+  setPlaneFromOriginAndNormal(outPlane, origin, scratchPickPlaneNormal);
+}
+
+function computePickFrustumPlanesInRootSpace(
+  scene,
+  windowPosition,
+  maxDistanceDrawingBuffer,
+  worldToRootMatrix,
+  outPlanes,
+) {
+  const context = scene.context;
+  const canvas = scene.canvas;
+  const pixelRatioX =
+    canvas && canvas.clientWidth > 0
+      ? context.drawingBufferWidth / canvas.clientWidth
+      : 1.0;
+  const pixelRatioY =
+    canvas && canvas.clientHeight > 0
+      ? context.drawingBufferHeight / canvas.clientHeight
+      : 1.0;
+
+  const dxWindow = maxDistanceDrawingBuffer / pixelRatioX;
+  const dyWindow = maxDistanceDrawingBuffer / pixelRatioY;
+
+  const cam = scene.camera;
+  const rayCenter = cam.getPickRay(windowPosition, scratchPickRay);
+  if (!defined(rayCenter)) {
+    return false;
+  }
+
+  scratchPickCornerTL.x = windowPosition.x - dxWindow;
+  scratchPickCornerTL.y = windowPosition.y - dyWindow;
+  scratchPickCornerTR.x = windowPosition.x + dxWindow;
+  scratchPickCornerTR.y = windowPosition.y - dyWindow;
+  scratchPickCornerBR.x = windowPosition.x + dxWindow;
+  scratchPickCornerBR.y = windowPosition.y + dyWindow;
+  scratchPickCornerBL.x = windowPosition.x - dxWindow;
+  scratchPickCornerBL.y = windowPosition.y + dyWindow;
+
+  const rayTL = cam.getPickRay(scratchPickCornerTL, scratchPickRayTL);
+  const rayTR = cam.getPickRay(scratchPickCornerTR, scratchPickRayTR);
+  const rayBR = cam.getPickRay(scratchPickCornerBR, scratchPickRayBR);
+  const rayBL = cam.getPickRay(scratchPickCornerBL, scratchPickRayBL);
+
+  if (!defined(rayTL) || !defined(rayTR) || !defined(rayBR) || !defined(rayBL)) {
+    return false;
+  }
+
+  // Transform center ray origin into root space
+  Matrix4.multiplyByPoint(worldToRootMatrix, rayCenter.origin, scratchPickRayOriginRoot);
+
+  // Transform direction via two-point method for stability
+  Cartesian3.add(rayCenter.origin, rayCenter.direction, scratchPickRayEndWorld);
+  Matrix4.multiplyByPoint(worldToRootMatrix, scratchPickRayEndWorld, scratchPickRayEndRoot);
+  Cartesian3.subtract(scratchPickRayEndRoot, scratchPickRayOriginRoot, scratchPickDirCenterRoot);
+  Cartesian3.normalize(scratchPickDirCenterRoot, scratchPickDirCenterRoot);
+
+  function toRootDir(ray, outDir) {
+    Matrix4.multiplyByPoint(worldToRootMatrix, ray.origin, scratchPickRayOriginRoot);
+    Cartesian3.add(ray.origin, ray.direction, scratchPickRayEndWorld);
+    Matrix4.multiplyByPoint(worldToRootMatrix, scratchPickRayEndWorld, scratchPickRayEndRoot);
+    Cartesian3.subtract(scratchPickRayEndRoot, scratchPickRayOriginRoot, outDir);
+    Cartesian3.normalize(outDir, outDir);
+  }
+
+  toRootDir(rayTL, scratchPickDirTLRoot);
+  toRootDir(rayTR, scratchPickDirTRRoot);
+  toRootDir(rayBL, scratchPickDirBLRoot);
+  toRootDir(rayBR, scratchPickDirBRRoot);
+
+  // Planes: [near, left, right, top, bottom]
+  setPlaneFromOriginAndNormal(outPlanes[0], scratchPickRayOriginRoot, scratchPickDirCenterRoot);
+  computeSidePlane(outPlanes[1], scratchPickRayOriginRoot, scratchPickDirTLRoot, scratchPickDirBLRoot, scratchPickDirCenterRoot);
+  computeSidePlane(outPlanes[2], scratchPickRayOriginRoot, scratchPickDirBRRoot, scratchPickDirTRRoot, scratchPickDirCenterRoot);
+  computeSidePlane(outPlanes[3], scratchPickRayOriginRoot, scratchPickDirTRRoot, scratchPickDirTLRoot, scratchPickDirCenterRoot);
+  computeSidePlane(outPlanes[4], scratchPickRayOriginRoot, scratchPickDirBLRoot, scratchPickDirBRRoot, scratchPickDirCenterRoot);
+
+  return true;
 }
 
 function createOutlineMaskUniformMap(baseUniformMap) {
@@ -1047,6 +1213,31 @@ function GaussianSplatPrimitive(options) {
   this._plyIndexToAggregateIndex = new Map();
 
   /**
+   * Octree for accelerating full-dataset picking (root-space positions).
+   * @type {undefined|GaussianSplatOctree}
+   * @private
+   */
+  this._splatOctree = undefined;
+
+  /**
+   * Whether the octree needs to be rebuilt because positions changed.
+   * @type {boolean}
+   * @private
+   */
+  this._splatOctreeDirty = true;
+
+  /**
+   * Octree build/query options.
+   * @type {object}
+   * @private
+   */
+  this._splatOctreeOptions = {
+    leafCapacity: 2048,
+    maxDepth: 12,
+    maxCandidates: 200000,
+  };
+
+  /**
    * Color modifications by PLY index.
    * @type {Map<number, Array<number>>}
    * @private
@@ -1350,6 +1541,41 @@ function GaussianSplatPrimitive(options) {
    * @private
    */
   this._outlineBoundaryStats = undefined;
+
+  /**
+   * Framebuffer used for GPU picking.
+   * @type {undefined|FramebufferManager}
+   * @private
+   */
+  this._pickFramebuffer = undefined;
+
+  /**
+   * Texture used to store pick results.
+   * @type {undefined|Texture}
+   * @private
+   */
+  this._pickTexture = undefined;
+
+  /**
+   * Whether GPU picking is enabled.
+   * @type {boolean}
+   * @private
+   */
+  this._enableGpuPicking = true;
+
+  /**
+   * Draw command for pick pass rendering.
+   * @type {undefined|DrawCommand}
+   * @private
+   */
+  this._pickDrawCommand = undefined;
+
+  /**
+   * Clear command for pick framebuffer.
+   * @type {undefined|ClearCommand}
+   * @private
+   */
+  this._pickClearCommand = undefined;
 }
 
 Object.defineProperties(GaussianSplatPrimitive.prototype, {
@@ -1625,6 +1851,19 @@ GaussianSplatPrimitive.prototype.getSplatInfoAtScreenPosition = function (
       ? options.worldMaxDistance
       : 0.05;
 
+  // Compute root->world once; reused both by octree candidate query and by final scan.
+  const tileset = this._tileset;
+  let rootToWorldMatrix;
+  if (defined(this._rootTransform) && defined(tileset?.modelMatrix)) {
+    rootToWorldMatrix = Matrix4.multiply(
+      tileset.modelMatrix,
+      this._rootTransform,
+      scratchMatrix4A,
+    );
+  } else {
+    rootToWorldMatrix = Matrix4.IDENTITY;
+  }
+
   //>>includeStart('debug', pragmas.debug);
   console.log("[拾取流程] getSplatInfoAtScreenPosition() 搜索参数:");
   console.log("  - searchSelectedOnly:", searchSelectedOnly);
@@ -1655,11 +1894,36 @@ GaussianSplatPrimitive.prototype.getSplatInfoAtScreenPosition = function (
     );
     //>>includeEnd('debug');
   } else if (!searchSelectedOnly) {
-    // fallback to entire dataset (may be large) – skip for now to avoid huge scans
-    candidateIndices = undefined;
-    //>>includeStart('debug', pragmas.debug);
-    console.log("[拾取流程] 警告: 未限制搜索范围，跳过整个数据集扫描");
-    //>>includeEnd('debug');
+    if (this._numSplats > 0) {
+      // Octree-accelerated full-dataset picking: query a small pick frustum around the click.
+      candidateIndices = this._getCandidateIndicesFromOctree(
+        scene,
+        windowPosition,
+        maxDistance,
+        rootToWorldMatrix,
+      );
+
+      // Fallback to full scan if octree query fails (preserve correctness).
+      if (!defined(candidateIndices) || candidateIndices.length === 0) {
+        candidateIndices = Array.from({ length: this._numSplats }, (_, i) => i);
+      }
+      //>>includeStart('debug', pragmas.debug);
+      console.log(
+        "[拾取流程] 搜索所有 splats，总数:",
+        candidateIndices.length
+      );
+      console.log(
+        "[拾取流程] 警告: 搜索整个数据集可能影响性能，建议使用 searchSelectedOnly: true 或提供 indices"
+      );
+      //>>includeEnd('debug');
+    } else {
+      candidateIndices = undefined;
+      //>>includeStart('debug', pragmas.debug);
+      console.log(
+        "[拾取流程] 警告: _numSplats 为 0，无法生成候选索引"
+      );
+      //>>includeEnd('debug');
+    }
   }
 
   if (!defined(candidateIndices) || candidateIndices.length === 0) {
@@ -1724,26 +1988,20 @@ GaussianSplatPrimitive.prototype.getSplatInfoAtScreenPosition = function (
   }
   //>>includeEnd('debug');
 
+  const maxDistanceSq = maxDistance * maxDistance;
+
+  // Pick heuristic:
+  // - Primary: closest in screen-space (follows mouse).
+  // - Secondary (within a tiny pixel epsilon around the best screen match): prefer the smallest ray depth (reduces "picking through").
+  // Implementation detail: keep a small Top-K list by screen distance, then select by depth within epsilon of the best.
   let closestIndex = -1;
   let closestDistance = maxDistance;
+  let closestDistanceSq = maxDistanceSq;
+  let closestViewZ = Number.NEGATIVE_INFINITY;
   let closestWorldIndex = -1;
   let closestWorldDistance = worldMaxDistance;
 
-  // Transform positions from root space to world space
-  // _positions are stored in root space (relative to _rootTransform)
-  // We need to transform them to world space for distance calculation
-  const tileset = this._tileset;
-  let rootToWorldMatrix;
-  if (defined(this._rootTransform) && defined(tileset.modelMatrix)) {
-    rootToWorldMatrix = Matrix4.multiply(
-      tileset.modelMatrix,
-      this._rootTransform,
-      scratchMatrix4A,
-    );
-  } else {
-    // Fallback: assume positions are already in world space
-    rootToWorldMatrix = Matrix4.IDENTITY;
-  }
+  // rootToWorldMatrix already computed above.
 
   //>>includeStart('debug', pragmas.debug);
   console.log("[拾取流程] 坐标转换矩阵:");
@@ -1762,8 +2020,19 @@ GaussianSplatPrimitive.prototype.getSplatInfoAtScreenPosition = function (
   let outOfRangeCount = 0;
   let distanceTooFarCount = 0;
   let worldDistanceTooFarCount = 0;
-  let minPixelDistance = Infinity;
+  // Track squared min pixel distance for accuracy/perf; converted to sqrt only for logs and debug comparisons.
+  let minPixelDistanceSq = Infinity;
   let minWorldDistance = Infinity;
+
+  // Maintain Top-K nearest splats by pixel distance to avoid both "sticky" depth picking and expensive multi-pass scans.
+  let topKCount = 0;
+
+  const pickRay = scene.camera.getPickRay(windowPosition, scratchPickRay);
+  const pickRayDefined = defined(pickRay);
+  if (pickRayDefined) {
+    // Ensure ray direction is normalized for stable ray-depth (t) comparison.
+    Cartesian3.normalize(pickRay.direction, pickRay.direction);
+  }
 
   for (let i = 0; i < candidateIndices.length; i++) {
     const index = candidateIndices[i];
@@ -1816,15 +2085,41 @@ GaussianSplatPrimitive.prototype.getSplatInfoAtScreenPosition = function (
 
     const dx = projected.x - drawingBufferPosition.x;
     const dy = projected.y - drawingBufferPosition.y;
-    const distance = Math.sqrt(dx * dx + dy * dy);
+    const distanceSq = dx * dx + dy * dy;
 
-    if (distance < minPixelDistance) {
-      minPixelDistance = distance;
+    if (distanceSq < minPixelDistanceSq) {
+      minPixelDistanceSq = distanceSq;
     }
 
-    if (distance <= closestDistance) {
-      closestDistance = distance;
-      closestIndex = index;
+    if (distanceSq <= maxDistanceSq) {
+      // Compute a stable depth metric along the pick ray (smaller positive t => closer to camera).
+      let rayT = Number.POSITIVE_INFINITY;
+      if (pickRayDefined) {
+        Cartesian3.subtract(worldPosition, pickRay.origin, scratchPickViewPosition);
+        rayT = Cartesian3.dot(scratchPickViewPosition, pickRay.direction);
+        // Ignore points behind the camera; they should not be picked.
+        if (rayT < 0.0) {
+          continue;
+        }
+      }
+
+      // Insert into Top-K by ascending pixel distance (small K, insertion-sort).
+      if (topKCount < PICK_TOP_K || distanceSq < scratchPickTopKDistanceSq[PICK_TOP_K - 1]) {
+        const insertLimit = topKCount < PICK_TOP_K ? topKCount : PICK_TOP_K - 1;
+        let j = insertLimit;
+        while (j > 0 && distanceSq < scratchPickTopKDistanceSq[j - 1]) {
+          scratchPickTopKDistanceSq[j] = scratchPickTopKDistanceSq[j - 1];
+          scratchPickTopKRayT[j] = scratchPickTopKRayT[j - 1];
+          scratchPickTopKIndices[j] = scratchPickTopKIndices[j - 1];
+          j--;
+        }
+        scratchPickTopKDistanceSq[j] = distanceSq;
+        scratchPickTopKRayT[j] = rayT;
+        scratchPickTopKIndices[j] = index;
+        if (topKCount < PICK_TOP_K) {
+          topKCount++;
+        }
+      }
     } else {
       distanceTooFarCount++;
     }
@@ -1849,6 +2144,36 @@ GaussianSplatPrimitive.prototype.getSplatInfoAtScreenPosition = function (
     }
   }
 
+  if (topKCount > 0) {
+    const bestDistanceSq = scratchPickTopKDistanceSq[0];
+    const thresholdSq = bestDistanceSq + PICK_PIXEL_TIE_EPSILON_SQ;
+
+    let bestIndex = scratchPickTopKIndices[0];
+    let bestRayT = scratchPickTopKRayT[0];
+    let bestDistSq = bestDistanceSq;
+
+    // Among near-ties (within epsilon), take the closest along the pick ray (smallest t).
+    // Since list is sorted by distanceSq, we can break early.
+    for (let k = 1; k < topKCount; k++) {
+      const dSq = scratchPickTopKDistanceSq[k];
+      if (dSq > thresholdSq) {
+        break;
+      }
+      const t = scratchPickTopKRayT[k];
+      if (t < bestRayT || (t === bestRayT && dSq < bestDistSq)) {
+        bestIndex = scratchPickTopKIndices[k];
+        bestRayT = t;
+        bestDistSq = dSq;
+      }
+    }
+
+    closestIndex = bestIndex;
+    // Keep closestViewZ for existing debug output compatibility.
+    closestViewZ = -bestRayT;
+    closestDistanceSq = bestDistSq;
+    closestDistance = Math.sqrt(bestDistSq);
+  }
+
   //>>includeStart('debug', pragmas.debug);
   console.log("[拾取流程] getSplatInfoAtScreenPosition() 搜索统计:");
   console.log("  - 候选索引总数:", candidateIndices.length);
@@ -1859,7 +2184,9 @@ GaussianSplatPrimitive.prototype.getSplatInfoAtScreenPosition = function (
   console.log("  - 世界距离过远数:", worldDistanceTooFarCount);
   console.log(
     "  - 最小像素距离:",
-    minPixelDistance === Infinity ? "N/A" : minPixelDistance.toFixed(2),
+    minPixelDistanceSq === Infinity
+      ? "N/A"
+      : Math.sqrt(minPixelDistanceSq).toFixed(2),
   );
   console.log(
     "  - 最小世界距离:",
@@ -1897,13 +2224,17 @@ GaussianSplatPrimitive.prototype.getSplatInfoAtScreenPosition = function (
       console.log("       - 可能 splat 位置在视锥体外");
       console.log("       - 可能 splat 位置被遮挡");
     } else if (
-      minPixelDistance > maxDistance &&
+      (minPixelDistanceSq === Infinity
+        ? true
+        : Math.sqrt(minPixelDistanceSq) > maxDistance) &&
       minWorldDistance > worldMaxDistance
     ) {
       console.log("    ❌ 所有候选 splat 的距离都超过阈值");
       console.log(
         "       - 最小像素距离:",
-        minPixelDistance.toFixed(2),
+        minPixelDistanceSq === Infinity
+          ? "N/A"
+          : Math.sqrt(minPixelDistanceSq).toFixed(2),
         ">",
         maxDistance,
       );
@@ -1914,11 +2245,14 @@ GaussianSplatPrimitive.prototype.getSplatInfoAtScreenPosition = function (
         worldMaxDistance,
       );
       console.log("       - 建议: 增大 maxDistance 或 worldMaxDistance");
-    } else if (minPixelDistance > maxDistance) {
+    } else if (
+      minPixelDistanceSq !== Infinity &&
+      Math.sqrt(minPixelDistanceSq) > maxDistance
+    ) {
       console.log("    ❌ 所有候选 splat 的像素距离都超过阈值");
       console.log(
         "       - 最小像素距离:",
-        minPixelDistance.toFixed(2),
+        Math.sqrt(minPixelDistanceSq).toFixed(2),
         ">",
         maxDistance,
       );
@@ -1968,6 +2302,72 @@ GaussianSplatPrimitive.prototype.getSplatInfoAtScreenPosition = function (
   //>>includeEnd('debug');
 
   return result;
+};
+
+GaussianSplatPrimitive.prototype._buildSplatOctreeIfNeeded = function () {
+  if (!this._splatOctreeDirty && defined(this._splatOctree)) {
+    return;
+  }
+  if (!defined(this._positions) || this._positions.length === 0 || this._numSplats <= 0) {
+    destroySplatOctree(this);
+    return;
+  }
+
+  // Rebuild octree in root space over current positions.
+  // Note: This can be expensive for very large datasets; we build lazily on demand.
+  this._splatOctree = new GaussianSplatOctree(
+    this._positions,
+    this._numSplats,
+    this._splatOctreeOptions,
+  );
+  this._splatOctreeDirty = false;
+};
+
+GaussianSplatPrimitive.prototype._getCandidateIndicesFromOctree = function (
+  scene,
+  windowPosition,
+  maxDistance,
+  rootToWorldMatrix,
+) {
+  if (!defined(scene) || !defined(scene.camera)) {
+    return undefined;
+  }
+
+  this._buildSplatOctreeIfNeeded();
+  if (!defined(this._splatOctree)) {
+    return undefined;
+  }
+
+  // world -> root transform
+  Matrix4.inverse(rootToWorldMatrix, scratchPickWorldToRoot);
+
+  const planes = [
+    scratchPickPlaneNear,
+    scratchPickPlaneLeft,
+    scratchPickPlaneRight,
+    scratchPickPlaneTop,
+    scratchPickPlaneBottom,
+  ];
+
+  const ok = computePickFrustumPlanesInRootSpace(
+    scene,
+    windowPosition,
+    maxDistance,
+    scratchPickWorldToRoot,
+    planes,
+  );
+  if (!ok) {
+    return undefined;
+  }
+
+  scratchCandidateIndices.length = 0;
+  this._splatOctree.queryFrustum(
+    planes,
+    scratchCandidateIndices,
+    this._splatOctreeOptions.maxCandidates,
+  );
+
+  return scratchCandidateIndices;
 };
 
 /**
@@ -2555,6 +2955,132 @@ GaussianSplatPrimitive.prototype.setSplatLockByPlyIndex = function (
 };
 
 /**
+ * Gets the center position (in WGS84 degrees) of a set of splats identified by their PLY indices.
+ * This method calculates the average position of all valid splats and returns it as Cartographic coordinates in degrees.
+ * @param {Array<number>|Set<number>} plyIndices The PLY indices of splats to calculate the center for.
+ * @param {Cartographic} [result] The object onto which to store the result.
+ * @returns {Cartographic|undefined} The center position in WGS84 degrees (longitude, latitude, height), or undefined if no valid positions found.
+ */
+GaussianSplatPrimitive.prototype.getPlyIndicesCenterCartographicDegrees = function (
+  plyIndices,
+  result,
+) {
+  if (!defined(plyIndices) || (Array.isArray(plyIndices) && plyIndices.length === 0)) {
+    return undefined;
+  }
+
+  const plyIndicesArray = Array.isArray(plyIndices)
+    ? plyIndices
+    : Array.from(plyIndices);
+
+  if (plyIndicesArray.length === 0) {
+    return undefined;
+  }
+
+  // Check if positions data is available
+  if (!defined(this._positions) || this._positions.length === 0) {
+    console.warn(
+      "[getPlyIndicesCenterCartographicDegrees] 位置数据不存在，无法计算中心点",
+    );
+    return undefined;
+  }
+
+  // Convert PLY indices to aggregate indices
+  const aggregateIndices = [];
+  for (let i = 0; i < plyIndicesArray.length; i++) {
+    const plyIndex = plyIndicesArray[i];
+    const aggregateIndex = this._plyIndexToAggregateIndex.get(plyIndex);
+    if (
+      defined(aggregateIndex) &&
+      aggregateIndex >= 0 &&
+      aggregateIndex < this._numSplats
+    ) {
+      aggregateIndices.push(aggregateIndex);
+    }
+  }
+
+  if (aggregateIndices.length === 0) {
+    console.warn(
+      "[getPlyIndicesCenterCartographicDegrees] 未找到有效的聚合索引",
+    );
+    return undefined;
+  }
+
+  // Get root to world transformation matrix
+  const tileset = this._tileset;
+  let rootToWorldMatrix;
+  if (defined(this._rootTransform) && defined(tileset?.modelMatrix)) {
+    rootToWorldMatrix = Matrix4.multiply(
+      tileset.modelMatrix,
+      this._rootTransform,
+      scratchMatrix4A,
+    );
+  } else {
+    // Fallback: assume positions are already in world space
+    rootToWorldMatrix = Matrix4.IDENTITY;
+  }
+
+  // Calculate center position by averaging all valid positions
+  const centerWorld = new Cartesian3(0, 0, 0);
+  let validCount = 0;
+
+  for (let i = 0; i < aggregateIndices.length; i++) {
+    const aggregateIndex = aggregateIndices[i];
+    const base = aggregateIndex * 3;
+
+    if (base + 2 >= this._positions.length) {
+      continue;
+    }
+
+    // Get position in root space
+    scratchPickCartesian.x = this._positions[base];
+    scratchPickCartesian.y = this._positions[base + 1];
+    scratchPickCartesian.z = this._positions[base + 2];
+
+    // Transform from root space to world space
+    const worldPosition = Matrix4.multiplyByPoint(
+      rootToWorldMatrix,
+      scratchPickCartesian,
+      scratchPickWorldPosition,
+    );
+
+    // Accumulate positions
+    Cartesian3.add(centerWorld, worldPosition, centerWorld);
+    validCount++;
+  }
+
+  if (validCount === 0) {
+    console.warn(
+      "[getPlyIndicesCenterCartographicDegrees] 没有有效的点位置",
+    );
+    return undefined;
+  }
+
+  // Calculate average (center)
+  Cartesian3.divideByScalar(centerWorld, validCount, centerWorld);
+
+  // Convert world position to Cartographic (radians)
+  const cartographic = Ellipsoid.WGS84.cartesianToCartographic(
+    centerWorld,
+    result,
+  );
+
+  if (!defined(cartographic)) {
+    console.warn(
+      "[getPlyIndicesCenterCartographicDegrees] 无法将世界坐标转换为地理坐标",
+    );
+    return undefined;
+  }
+
+  // Convert radians to degrees
+  cartographic.longitude = CesiumMath.toDegrees(cartographic.longitude);
+  cartographic.latitude = CesiumMath.toDegrees(cartographic.latitude);
+  // Height is already in meters, no conversion needed
+
+  return cartographic;
+};
+
+/**
  * Since we aren't visible at the scene level, we need to wrap the tileset update
  * so we not only get called but ensure we update immediately after the tileset.
  * @param {FrameState} frameState
@@ -2602,6 +3128,7 @@ GaussianSplatPrimitive.prototype.destroy = function () {
   }
 
   destroyOutlineResources(this);
+  destroyPickResources(this);
 
   this._tileset.update = this._baseTilesetUpdate.bind(this._tileset);
 
@@ -3178,19 +3705,47 @@ GaussianSplatPrimitive.buildGSplatDrawCommand = function (
   frameState,
 ) {
   const tileset = primitive._tileset;
+  const isPickPass = frameState.passes.pick === true;
+  
+  //>>includeStart('debug', pragmas.debug);
+  console.log("[buildGSplatDrawCommand] 检查拾取模式:");
+  console.log("  - frameState.passes.pick:", frameState.passes.pick);
+  console.log("  - isPickPass:", isPickPass);
+  //>>includeEnd('debug');
+  
   const renderResources = new GaussianSplatRenderResources(primitive);
   const { shaderBuilder } = renderResources;
   const renderStateOptions = renderResources.renderStateOptions;
   renderStateOptions.cull.enabled = false;
   renderStateOptions.depthMask = false;
-  renderStateOptions.depthTest.enabled = true;
-  renderStateOptions.blending = BlendingState.PRE_MULTIPLIED_ALPHA_BLEND;
-  renderResources.alphaOptions.pass = Pass.GAUSSIAN_SPLATS;
+  // In pick pass, disable depth test to ensure all fragments are written
+  // This is important because we want to pick the first splat at the click position
+  renderStateOptions.depthTest.enabled = isPickPass ? false : true;
+  // In pick pass, disable blending to ensure exact color output
+  renderStateOptions.blending = isPickPass 
+    ? BlendingState.DISABLED 
+    : BlendingState.PRE_MULTIPLIED_ALPHA_BLEND;
+  // For pick pass, use OPAQUE pass (Cesium doesn't have Pass.PICK)
+  renderResources.alphaOptions.pass = isPickPass ? Pass.OPAQUE : Pass.GAUSSIAN_SPLATS;
 
   shaderBuilder.addAttribute("vec2", "a_screenQuadPosition");
   shaderBuilder.addAttribute("float", "a_splatIndex");
   shaderBuilder.addVarying("vec4", "v_splatColor");
   shaderBuilder.addVarying("vec2", "v_vertPos");
+  
+  // Add pick pass support
+  if (isPickPass) {
+    shaderBuilder.addDefine("PICK_PASS", "1", ShaderDestination.BOTH);
+    shaderBuilder.addVarying("vec4", "v_pickColor");
+    //>>includeStart('debug', pragmas.debug);
+    console.log("[buildGSplatDrawCommand] 添加 PICK_PASS 宏和 v_pickColor varying");
+    //>>includeEnd('debug');
+  } else {
+    //>>includeStart('debug', pragmas.debug);
+    console.log("[buildGSplatDrawCommand] 非拾取模式，isPickPass =", isPickPass);
+    console.log("[buildGSplatDrawCommand] frameState.passes.pick =", frameState.passes.pick);
+    //>>includeEnd('debug');
+  }
   shaderBuilder.addUniform(
     "float",
     "u_splitDirection",
@@ -3491,6 +4046,88 @@ GaussianSplatPrimitive.buildGSplatDrawCommand = function (
   shaderBuilder.addFragmentLines(GaussianSplatFS);
 
   const shaderProgram = shaderBuilder.buildShaderProgram(frameState.context);
+  
+  //>>includeStart('debug', pragmas.debug);
+  if (isPickPass) {
+    console.log("[buildGSplatDrawCommand] 着色器编译后检查:");
+    // Check if PICK_PASS define was added to shaderBuilder
+    const vertexDefines = shaderBuilder._vertexShaderParts?.defineLines || [];
+    const fragmentDefines = shaderBuilder._fragmentShaderParts?.defineLines || [];
+    const hasPickPassVS = vertexDefines.some((line) => line.includes("PICK_PASS"));
+    const hasPickPassFS = fragmentDefines.some((line) => line.includes("PICK_PASS"));
+    console.log("  - 顶点着色器 define 包含 PICK_PASS:", hasPickPassVS);
+    console.log("  - 片段着色器 define 包含 PICK_PASS:", hasPickPassFS);
+    console.log("  - 顶点 define 行数:", vertexDefines.length);
+    console.log("  - 片段 define 行数:", fragmentDefines.length);
+    if (vertexDefines.length > 0) {
+      console.log("  - 顶点 define 示例:", vertexDefines.slice(0, 5));
+      // Check if PICK_PASS is in the defines
+      const pickPassDefine = vertexDefines.find(line => line.includes('PICK_PASS'));
+      console.log("  - PICK_PASS define 行:", pickPassDefine);
+    }
+    if (fragmentDefines.length > 0) {
+      console.log("  - 片段 define 示例:", fragmentDefines.slice(0, 5));
+      const pickPassDefine = fragmentDefines.find(line => line.includes('PICK_PASS'));
+      console.log("  - PICK_PASS define 行:", pickPassDefine);
+    }
+    
+    // Check compiled shader source
+    if (defined(shaderProgram)) {
+      // ShaderSource stores defines separately, use createCombined methods to get full source
+      const vsShaderSource = shaderProgram._vertexShaderSource;
+      const fsShaderSource = shaderProgram._fragmentShaderSource;
+      
+      let vsSource = '';
+      let fsSource = '';
+      
+      // Use createCombined methods if available (combines defines and sources)
+      if (vsShaderSource && typeof vsShaderSource.createCombinedVertexShader === 'function') {
+        vsSource = vsShaderSource.createCombinedVertexShader(frameState.context);
+      } else if (typeof vsShaderSource === 'string') {
+        vsSource = vsShaderSource;
+      } else if (vsShaderSource && vsShaderSource.defines) {
+        // Manually combine defines and sources
+        const defines = Array.isArray(vsShaderSource.defines) 
+          ? vsShaderSource.defines.join('\n') 
+          : String(vsShaderSource.defines);
+        const sources = Array.isArray(vsShaderSource.sources) 
+          ? vsShaderSource.sources.join('\n') 
+          : String(vsShaderSource.sources || '');
+        vsSource = defines + '\n' + sources;
+      }
+      
+      if (fsShaderSource && typeof fsShaderSource.createCombinedFragmentShader === 'function') {
+        fsSource = fsShaderSource.createCombinedFragmentShader(frameState.context);
+      } else if (typeof fsShaderSource === 'string') {
+        fsSource = fsShaderSource;
+      } else if (fsShaderSource && fsShaderSource.defines) {
+        const defines = Array.isArray(fsShaderSource.defines) 
+          ? fsShaderSource.defines.join('\n') 
+          : String(fsShaderSource.defines);
+        const sources = Array.isArray(fsShaderSource.sources) 
+          ? fsShaderSource.sources.join('\n') 
+          : String(fsShaderSource.sources || '');
+        fsSource = defines + '\n' + sources;
+      }
+      
+      const vsHasPickPass = String(vsSource).includes('PICK_PASS') || String(vsSource).includes('#define PICK_PASS');
+      const fsHasPickPass = String(fsSource).includes('PICK_PASS') || String(fsSource).includes('#define PICK_PASS');
+      console.log("  - 编译后的顶点着色器包含 PICK_PASS:", vsHasPickPass);
+      console.log("  - 编译后的片段着色器包含 PICK_PASS:", fsHasPickPass);
+      if (!vsHasPickPass || !fsHasPickPass) {
+        console.warn("[buildGSplatDrawCommand] ⚠️ 编译后的着色器不包含 PICK_PASS 宏！");
+        console.warn("  - 顶点着色器类型:", typeof vsShaderSource);
+        console.warn("  - 片段着色器类型:", typeof fsShaderSource);
+        if (vsSource.length > 0) {
+          console.warn("  - 顶点着色器前500字符:", vsSource.substring(0, 500));
+        }
+        if (fsSource.length > 0) {
+          console.warn("  - 片段着色器前500字符:", fsSource.substring(0, 500));
+        }
+      }
+    }
+  }
+  //>>includeEnd('debug');
 
   // 验证着色器是否包含状态处理
   if (defined(primitive._splatStateTexture)) {
@@ -3688,7 +4325,7 @@ GaussianSplatPrimitive.buildGSplatDrawCommand = function (
     vertexArray: vertexArrayCache,
     shaderProgram: shaderProgram,
     cull: renderStateOptions.cull.enabled,
-    pass: Pass.GAUSSIAN_SPLATS,
+    pass: isPickPass ? Pass.OPAQUE : Pass.GAUSSIAN_SPLATS,
     count: renderResources.count,
     owner: this,
     instanceCount: renderResources.instanceCount,
@@ -3696,7 +4333,7 @@ GaussianSplatPrimitive.buildGSplatDrawCommand = function (
     debugShowBoundingVolume: tileset.debugShowBoundingVolume,
     castShadows: false,
     receiveShadows: false,
-    pickId: defined(pickId) ? "czm_pickColor" : undefined,
+    pickId: defined(pickId) && !isPickPass ? "czm_pickColor" : undefined,
   });
 
   // Set pick color uniform if pickId exists
@@ -4030,6 +4667,9 @@ GaussianSplatPrimitive.prototype.update = function (frameState) {
       tileset._selectedTiles.length !== 0 &&
       tileset._selectedTiles.length !== this.selectedTileLength
     ) {
+      // Positions will be rebuilt; invalidate octree.
+      destroySplatOctree(this);
+
       this._numSplats = 0;
       this._positions = undefined;
       this._rotations = undefined;
@@ -4234,6 +4874,9 @@ GaussianSplatPrimitive.prototype.update = function (frameState) {
         (content) => content.positions,
         3,
       );
+
+      // New positions array; mark octree dirty (rebuilt lazily on next pick).
+      this._splatOctreeDirty = true;
 
       this._scales = aggregateAttributeValues(
         ComponentDatatype.FLOAT,
